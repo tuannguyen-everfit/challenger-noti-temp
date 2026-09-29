@@ -3,11 +3,33 @@
 .env*
 !.env.test
 # mise.local.toml is per-developer; copy from mise.local.example.toml.
+# Also covers mise's per-env (mise.<env>.local.toml) and dotfile variants.
 mise.local.toml
+mise.*.local.toml
+.mise.local.toml
+.mise.*.local.toml
 
 # Secrets — private keys and any other PEM/key material never get committed.
 *.pem
 *.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+# Cloud / cluster credentials.
+*credentials*.json
+service-account*.json
+kubeconfig
+*.kubeconfig
+.netrc
+.npmrc
+
+# Per-developer Claude Code overrides (may hold tokens / personal permissions).
+.claude/settings.local.json
+CLAUDE.local.md
 
 # Go
 /bin/
