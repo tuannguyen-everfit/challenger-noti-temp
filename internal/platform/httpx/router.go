@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/Everfit-io/go-service-template/internal/features/notification"
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/health"
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
@@ -28,9 +29,10 @@ const apiVersionPrefix = "/api/v1"
 // growing the positional parameter list) keeps the signature stable as we add
 // features and platform pieces.
 type RouterDeps struct {
-	Health *health.Handler
+	Health       *health.Handler
+	Notification *notification.Handler
 	// AccessVerifier verifies Bearer access tokens for the authed feature
-	// group. nil (JWT secrets not configured at boot) leaves that group off.
+	// group. Required: app.go fails boot without JWT secrets.
 	AccessVerifier   middleware.AccessVerifier
 	IdempotencyCache middleware.IdempotencyCache // app.go wires the Valkey-backed adapter
 	HTTPTimeout      time.Duration               // global default request timeout; 0 = no timeout
@@ -110,14 +112,12 @@ func NewRouter(deps RouterDeps) http.Handler {
 		// Public feature mounts go here: r.Mount("/<feature>", deps.<Feature>.Routes()).
 
 		// Bearer-authed features — the middleware reads the JWT `sub` claim and
-		// stamps it on ctx (middleware.UserIDFromContext). Skipped entirely when
-		// AccessVerifier is unset.
-		if deps.AccessVerifier != nil {
-			r.Group(func(r chi.Router) {
-				r.Use(middleware.BearerAuth(deps.AccessVerifier))
-				// r.Mount("/<feature>", deps.<Feature>.Routes())
-			})
-		}
+		// stamps it on ctx (middleware.UserIDFromContext). A nil AccessVerifier
+		// fails closed (500) inside BearerAuth.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.BearerAuth(deps.AccessVerifier))
+			r.Mount("/notifications", deps.Notification.Routes())
+		})
 	})
 
 	// otelhttp at the OUTERMOST layer so it captures total latency and pulls

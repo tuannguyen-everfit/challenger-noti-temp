@@ -10,6 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Everfit-io/go-service-template/internal/features/notification"
 	"github.com/Everfit-io/go-service-template/internal/infra/kafka"
 	"github.com/Everfit-io/go-service-template/internal/infra/mongox"
 	"github.com/Everfit-io/go-service-template/internal/infra/otelx"
@@ -38,8 +39,9 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	log.Info("mongo ready", slog.String("phase", "startup"))
 
-	// Register each feature's IndexEnsurer here: <feature>.NewIndexEnsurer(mongoClient).
-	if err := mongoClient.EnsureIndexes(ctx); err != nil {
+	if err := mongoClient.EnsureIndexes(ctx,
+		notification.NewIndexEnsurer(mongoClient),
+	); err != nil {
 		return fmt.Errorf("app: ensure indexes: %w", err)
 	}
 
@@ -67,6 +69,12 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
+	notificationSvc := notification.New(
+		notification.NewMongoRepository(mongoClient),
+		notification.Config{MaxListLimit: cfg.Pagination.MaxLimit},
+	)
+	notificationHandler := notification.NewHandler(notificationSvc)
+
 	healthHandler := health.New(mongoClient, valkeyClient, health.Meta{
 		Region:  cfg.AppRegion,
 		Name:    cfg.AppName,
@@ -76,7 +84,8 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	router := httpx.NewRouter(httpx.RouterDeps{
 		Health:                 healthHandler,
-		AccessVerifier:         accessVerifier, // nil when JWT secrets unset; router skips the authed group
+		Notification:           notificationHandler,
+		AccessVerifier:         accessVerifier,
 		IdempotencyCache:       newValkeyIdempotencyCache(valkeyClient),
 		HTTPTimeout:            cfg.HTTPTimeout,
 		ThrottleMax:            cfg.HTTPThrottle.Max,
@@ -122,12 +131,9 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 }
 
 // newAccessVerifier builds the JWT signer that backs middleware.BearerAuth.
-// Opt-in: returns (nil, nil) when either secret is unset, and the router then
-// leaves the authed group off.
+// Both secrets are required (config.validate enforces it) because every route
+// this service serves is authed.
 func newAccessVerifier(cfg config.AuthConfig) (middleware.AccessVerifier, error) {
-	if cfg.JWTAccessSecret == "" || cfg.JWTRefreshSecret == "" {
-		return nil, nil
-	}
 	signer, err := authtoken.New(authtoken.Config{
 		AccessSecret:  cfg.JWTAccessSecret,
 		RefreshSecret: cfg.JWTRefreshSecret,

@@ -163,6 +163,7 @@ Each trigger links to a [.claude/rules/](.claude/rules/) detail file. Match a tr
 - Spaces for `.go` indentation → gofmt enforces tabs (set editor `tabSize`)
 - `// File: foo.go` header banners, ASCII boxes, multi-paragraph file headers → one-line `// Package x ...` only
 - Section dividers inside structs (`// === Public methods ===`) → godoc ordering + exported-first
+- **Comments must be concise and non-redundant** — default to no comments; when one is needed, keep it short and only explain non-obvious WHY (a constraint, invariant, or workaround), never restate WHAT the code does ([layout.md](.claude/rules/layout.md) §2.4)
 - Setters/getters wrapping plain fields → export the field
 - `if err != nil { return nil, errors.New("failed") }` losing the cause → wrap with `%w`
 

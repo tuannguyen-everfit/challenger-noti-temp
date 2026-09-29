@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"syscall"
+	_ "time/tzdata" // IANA zones for ?tz= even on images without /usr/share/zoneinfo
 
 	"github.com/Everfit-io/go-service-template/internal/app"
 	"github.com/Everfit-io/go-service-template/internal/platform/buildinfo"

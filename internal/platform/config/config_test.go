@@ -34,8 +34,10 @@ func setEnv(t *testing.T, kv map[string]string) {
 // validBaseEnv is the minimum a deploy must set for Load to succeed.
 func validBaseEnv() map[string]string {
 	return map[string]string{
-		"SVC_MONGO_URI":   "mongodb://localhost:27017/?replicaSet=rs0",
-		"SVC_VALKEY_ADDR": "localhost:6379",
+		"SVC_MONGO_URI":               "mongodb://localhost:27017/?replicaSet=rs0",
+		"SVC_VALKEY_ADDR":             "localhost:6379",
+		"SVC_AUTH_JWT_ACCESS_SECRET":  "access",
+		"SVC_AUTH_JWT_REFRESH_SECRET": "refresh",
 	}
 }
 
@@ -138,14 +140,11 @@ func TestLoad_LogLevelOverride(t *testing.T) {
 	}
 }
 
-func TestLoad_Auth_JWTDefaults(t *testing.T) {
+func TestLoad_Auth_JWTTTLDefaults(t *testing.T) {
 	setEnv(t, validBaseEnv())
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load err: %v", err)
-	}
-	if cfg.Auth.JWTAccessSecret != "" || cfg.Auth.JWTRefreshSecret != "" {
-		t.Errorf("JWT secrets default = %q / %q, want empty (authed group off)", cfg.Auth.JWTAccessSecret, cfg.Auth.JWTRefreshSecret)
 	}
 	if cfg.Auth.JWTAccessTTL != time.Hour {
 		t.Errorf("JWTAccessTTL = %v, want 1h", cfg.Auth.JWTAccessTTL)
@@ -157,14 +156,14 @@ func TestLoad_Auth_JWTDefaults(t *testing.T) {
 
 func TestLoad_Auth_JWTSecretsFromEnv(t *testing.T) {
 	env := validBaseEnv()
-	env["SVC_AUTH_JWT_ACCESS_SECRET"] = "access"
-	env["SVC_AUTH_JWT_REFRESH_SECRET"] = "refresh"
+	env["SVC_AUTH_JWT_ACCESS_SECRET"] = "access-from-env"
+	env["SVC_AUTH_JWT_REFRESH_SECRET"] = "refresh-from-env"
 	setEnv(t, env)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load err: %v", err)
 	}
-	if cfg.Auth.JWTAccessSecret != "access" || cfg.Auth.JWTRefreshSecret != "refresh" {
+	if cfg.Auth.JWTAccessSecret != "access-from-env" || cfg.Auth.JWTRefreshSecret != "refresh-from-env" {
 		t.Errorf("JWT secrets = %q / %q", cfg.Auth.JWTAccessSecret, cfg.Auth.JWTRefreshSecret)
 	}
 }
@@ -196,6 +195,8 @@ func TestValidate_Guards(t *testing.T) {
 	}{
 		{"http timeout must be positive", map[string]string{"SVC_HTTP_TIMEOUT": "0s"}, "SVC_HTTP_TIMEOUT"},
 		{"pagination limit must be >= 1", map[string]string{"SVC_PAGINATION_MAX_LIMIT": "0"}, "SVC_PAGINATION_MAX_LIMIT"},
+		{"jwt access secret required", map[string]string{"SVC_AUTH_JWT_ACCESS_SECRET": ""}, "SVC_AUTH_JWT_ACCESS_SECRET"},
+		{"jwt refresh secret required", map[string]string{"SVC_AUTH_JWT_REFRESH_SECRET": ""}, "SVC_AUTH_JWT_REFRESH_SECRET"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

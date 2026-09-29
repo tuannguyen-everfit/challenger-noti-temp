@@ -39,6 +39,9 @@ services:
       SVC_MONGO_URI: "mongodb://mongo:27017/?replicaSet=rs0&directConnection=true"
       SVC_MONGO_DATABASE: service
       SVC_VALKEY_ADDR: "valkey:6379"
+      # Dev-only JWT secrets — boot fails without them (config.validate).
+      SVC_AUTH_JWT_ACCESS_SECRET: local-access-secret-dev-only
+      SVC_AUTH_JWT_REFRESH_SECRET: local-refresh-secret-dev-only
       # OTel: NOT set here on purpose. With OTEL_EXPORTER_OTLP_ENDPOINT unset,
       # otelx.Setup goes into "local-only" mode (spans created for log↔trace
       # correlation, but nothing exported). `make compose-up-signoz` adds
