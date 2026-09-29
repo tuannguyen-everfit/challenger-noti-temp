@@ -80,6 +80,21 @@ func (c *Client) Ping(ctx context.Context) error {
 	return c.Client.Ping(ctx, nil)
 }
 
+// WithTransaction runs fn in one multi-document transaction (replica set
+// required). Every call made with fn's ctx commits or rolls back together; the
+// driver re-runs fn on TransientTransactionError, so fn must be re-runnable.
+func (c *Client) WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	sess, err := c.StartSession()
+	if err != nil {
+		return fmt.Errorf("mongox: start session: %w", err)
+	}
+	defer sess.EndSession(context.WithoutCancel(ctx))
+	_, err = sess.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
+		return nil, fn(txCtx)
+	})
+	return err
+}
+
 // Close disconnects the underlying mongo client.
 func (c *Client) Close(ctx context.Context) error {
 	return c.Disconnect(ctx)

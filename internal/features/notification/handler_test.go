@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,11 +17,31 @@ import (
 )
 
 type mockNotificationService struct {
-	listIn     []ListFeedInput
-	listRes    ListFeedResult
-	summaryIn  []SummaryInput
-	summaryRes SummaryResult
-	err        error
+	listIn      []ListFeedInput
+	listRes     ListFeedResult
+	summaryIn   []SummaryInput
+	summaryRes  SummaryResult
+	registerIn  []RegisterDeviceInput
+	registerRes Device
+	removeIn    []RemoveDeviceInput
+	removeRes   bool
+	err         error
+}
+
+func (m *mockNotificationService) RegisterDevice(_ context.Context, in RegisterDeviceInput) (Device, error) {
+	m.registerIn = append(m.registerIn, in)
+	if m.err != nil {
+		return Device{}, m.err
+	}
+	return m.registerRes, nil
+}
+
+func (m *mockNotificationService) RemoveDevice(_ context.Context, in RemoveDeviceInput) (bool, error) {
+	m.removeIn = append(m.removeIn, in)
+	if m.err != nil {
+		return false, m.err
+	}
+	return m.removeRes, nil
 }
 
 func (m *mockNotificationService) ListFeed(_ context.Context, in ListFeedInput) (ListFeedResult, error) {
@@ -303,4 +324,132 @@ func TestSummary_DefaultTZIsUTC(t *testing.T) {
 	if len(svc.summaryIn) != 1 || svc.summaryIn[0].Location != time.UTC || svc.summaryIn[0].Tab != TabAll {
 		t.Errorf("svc input = %+v, want UTC + tab all", svc.summaryIn)
 	}
+}
+
+// serveDevices drives a request through DeviceRoutes() with userID stamped as the JWT sub ("" = none).
+func serveDevices(t *testing.T, svc *mockNotificationService, userID, method, target, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader = http.NoBody
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req := httptest.NewRequestWithContext(middleware.WithUserID(context.Background(), userID), method, target, reader)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(svc).DeviceRoutes().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestRegisterDevice_PassesInputAndHidesToken(t *testing.T) {
+	user := bson.NewObjectID()
+	updated := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	svc := &mockNotificationService{registerRes: Device{DeviceID: "d-1", Platform: PlatformIOS, Token: "secret-token", UpdatedAt: updated}}
+
+	rec := serveDevices(t, svc, user.Hex(), http.MethodPut, "/d-1", `{"platform":"ios","token":"secret-token","app_version":"1.4.0"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	want := RegisterDeviceInput{UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "secret-token", AppVersion: "1.4.0"}
+	if len(svc.registerIn) != 1 || svc.registerIn[0] != want {
+		t.Fatalf("svc input = %+v, want %+v", svc.registerIn, want)
+	}
+	body := decodeBody(t, rec)
+	if body["device_id"] != "d-1" || body["platform"] != "ios" || body["updated_at"] != "2026-09-29T10:00:00Z" {
+		t.Errorf("body = %v", body)
+	}
+	if strings.Contains(rec.Body.String(), "secret-token") {
+		t.Error("token echoed on the wire")
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Errorf("Cache-Control = %q", got)
+	}
+}
+
+func TestRegisterDevice_AppVersionOptional(t *testing.T) {
+	svc := &mockNotificationService{}
+	rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodPut, "/d-1", `{"platform":"android","token":"t"}`)
+	if rec.Code != http.StatusOK || len(svc.registerIn) != 1 || svc.registerIn[0].AppVersion != "" {
+		t.Errorf("status = %d, input = %+v", rec.Code, svc.registerIn)
+	}
+}
+
+func TestRegisterDevice_InvalidRequest(t *testing.T) {
+	longID := strings.Repeat("d", 129)
+	cases := map[string]struct{ target, body string }{
+		"web platform":       {"/d-1", `{"platform":"web","token":"t"}`},
+		"missing platform":   {"/d-1", `{"token":"t"}`},
+		"empty token":        {"/d-1", `{"platform":"ios","token":""}`},
+		"missing token":      {"/d-1", `{"platform":"ios"}`},
+		"device_id too long": {"/" + longID, `{"platform":"ios","token":"t"}`},
+		"unknown field":      {"/d-1", `{"platform":"ios","token":"t","user_id":"x"}`},
+		"no body":            {"/d-1", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc := &mockNotificationService{}
+			rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodPut, tc.target, tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body %s", rec.Code, rec.Body.String())
+			}
+			if len(svc.registerIn) != 0 {
+				t.Errorf("svc called %d times, want 0", len(svc.registerIn))
+			}
+		})
+	}
+}
+
+func TestRegisterDevice_NoUser(t *testing.T) {
+	svc := &mockNotificationService{}
+	rec := serveDevices(t, svc, "", http.MethodPut, "/d-1", `{"platform":"ios","token":"t"}`)
+	assertError(t, rec, http.StatusUnauthorized, "UNAUTHORIZED")
+	if len(svc.registerIn) != 0 {
+		t.Error("svc called without a caller")
+	}
+}
+
+func TestRegisterDevice_ServiceError(t *testing.T) {
+	svc := &mockNotificationService{err: errors.New("audit write: mongo down")}
+	rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodPut, "/d-1", `{"platform":"ios","token":"t"}`)
+	assertError(t, rec, http.StatusInternalServerError, "INTERNAL_ERROR")
+	if strings.Contains(rec.Body.String(), "mongo") {
+		t.Errorf("internal error leaked: %s", rec.Body.String())
+	}
+}
+
+func TestRemoveDevice_ReportsRemoved(t *testing.T) {
+	for _, removed := range []bool{true, false} {
+		user := bson.NewObjectID()
+		svc := &mockNotificationService{removeRes: removed}
+		rec := serveDevices(t, svc, user.Hex(), http.MethodDelete, "/d-1", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if got := decodeBody(t, rec)["removed"]; got != removed {
+			t.Errorf("removed = %v, want %v", got, removed)
+		}
+		if want := (RemoveDeviceInput{UserID: user, DeviceID: "d-1"}); len(svc.removeIn) != 1 || svc.removeIn[0] != want {
+			t.Errorf("svc input = %+v, want %+v", svc.removeIn, want)
+		}
+	}
+}
+
+func TestRemoveDevice_InvalidRequest(t *testing.T) {
+	svc := &mockNotificationService{}
+	rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodDelete, "/"+strings.Repeat("d", 129), "")
+	assertError(t, rec, http.StatusBadRequest, "INVALID_REQUEST")
+	if len(svc.removeIn) != 0 {
+		t.Error("svc called on an invalid request")
+	}
+}
+
+func TestRemoveDevice_NoUser(t *testing.T) {
+	rec := serveDevices(t, &mockNotificationService{}, "", http.MethodDelete, "/d-1", "")
+	assertError(t, rec, http.StatusUnauthorized, "UNAUTHORIZED")
+}
+
+func TestRemoveDevice_ServiceError(t *testing.T) {
+	svc := &mockNotificationService{err: errors.New("mongo down")}
+	rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodDelete, "/d-1", "")
+	assertError(t, rec, http.StatusInternalServerError, "INTERNAL_ERROR")
 }

@@ -73,3 +73,70 @@ func TestBuildRangeFilter(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDeviceUpsert(t *testing.T) {
+	user := bson.NewObjectID()
+	actor := Actor{Type: ActorTypeUser, ID: user.Hex(), Via: actorViaAPI}
+	at := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	d := Device{
+		UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "tok", AppVersion: "1.0",
+		LastRegisteredAt: at, CreatedBy: actor, CreatedAt: at, UpdatedBy: &actor, UpdatedAt: at,
+	}
+
+	got := buildDeviceUpsert(d)
+	want := bson.M{
+		"$set": bson.M{
+			"platform": PlatformIOS, "token": "tok", "app_version": "1.0",
+			"last_registered_at": at, "updated_at": at, "updated_by": &actor,
+		},
+		"$setOnInsert": bson.M{"created_at": at, "created_by": actor},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("buildDeviceUpsert = %v, want %v", got, want)
+	}
+
+	d.AppVersion = ""
+	got = buildDeviceUpsert(d)
+	if _, ok := got["$set"].(bson.M)["app_version"]; ok {
+		t.Error("empty app_version must not be $set")
+	}
+	if !reflect.DeepEqual(got["$unset"], bson.M{"app_version": ""}) {
+		t.Errorf("$unset = %v, want app_version", got["$unset"])
+	}
+}
+
+func TestBuildDeviceKeyFilter(t *testing.T) {
+	user := bson.NewObjectID()
+	if got, want := buildDeviceKeyFilter(user, "d-1"), (bson.M{"user_id": user, "device_id": "d-1"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("buildDeviceKeyFilter = %v, want %v", got, want)
+	}
+}
+
+// TestFieldChange_BSON pins the stored shape: "" is kept as a value, nil and false are omitted.
+func TestFieldChange_BSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   FieldChange
+		want bson.M
+	}{
+		{"value to value", FieldChange{From: "1.0", To: "1.1"}, bson.M{"from": "1.0", "to": "1.1"}},
+		{"empty from", FieldChange{From: "", To: "1.1"}, bson.M{"from": "", "to": "1.1"}},
+		{"unset before", FieldChange{To: "1.1"}, bson.M{"to": "1.1"}},
+		{"masked", FieldChange{Changed: true}, bson.M{"changed": true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := bson.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var got bson.M
+			if err := bson.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("stored = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

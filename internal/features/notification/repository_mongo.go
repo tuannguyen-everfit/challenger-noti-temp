@@ -2,6 +2,7 @@ package notification
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,11 +13,22 @@ import (
 	"github.com/Everfit-io/go-service-template/internal/infra/mongox"
 )
 
-type mongoRepo struct{ coll *mongo.Collection }
+type mongoRepo struct {
+	client  *mongox.Client
+	coll    *mongo.Collection
+	devices *mongo.Collection
+}
 
-// NewMongoRepository returns the MongoDB-backed Repo.
+// NewMongoRepository returns the MongoDB-backed Repo over notifications and notification_devices.
 func NewMongoRepository(m *mongox.Client) Repo {
-	return &mongoRepo{coll: m.DB.Collection(collectionName)}
+	return &mongoRepo{client: m, coll: m.DB.Collection(collectionName), devices: m.DB.Collection(deviceCollectionName)}
+}
+
+type mongoAuditWriter struct{ coll *mongo.Collection }
+
+// NewMongoAuditWriter returns the MongoDB-backed AuditWriter over notification_audit_logs.
+func NewMongoAuditWriter(m *mongox.Client) AuditWriter {
+	return &mongoAuditWriter{coll: m.DB.Collection(auditCollectionName)}
 }
 
 // ListFeed uses index `notifications_feed` (TabAll) or `notifications_feed_tab`.
@@ -51,6 +63,74 @@ func (r *mongoRepo) CountRange(ctx context.Context, userID bson.ObjectID, tab Ta
 		return 0, fmt.Errorf("notification: count range: %w", err)
 	}
 	return n, nil
+}
+
+// WithTransaction delegates to mongox; both adapters join the transaction through fn's ctx.
+func (r *mongoRepo) WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	return r.client.WithTransaction(ctx, fn)
+}
+
+// FindDevice uses index `devices_user_device`.
+func (r *mongoRepo) FindDevice(ctx context.Context, userID bson.ObjectID, deviceID string) (Device, bool, error) {
+	return r.findDevice(ctx, buildDeviceKeyFilter(userID, deviceID))
+}
+
+// FindDeviceByToken uses index `devices_token`.
+func (r *mongoRepo) FindDeviceByToken(ctx context.Context, token string) (Device, bool, error) {
+	return r.findDevice(ctx, bson.M{"token": token})
+}
+
+// UpsertDevice uses index `devices_user_device`.
+func (r *mongoRepo) UpsertDevice(ctx context.Context, d Device) (bson.ObjectID, error) {
+	res, err := r.devices.UpdateOne(ctx, buildDeviceKeyFilter(d.UserID, d.DeviceID), buildDeviceUpsert(d), options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return bson.ObjectID{}, fmt.Errorf("notification: upsert device: %w", err)
+	}
+	if id, ok := res.UpsertedID.(bson.ObjectID); ok {
+		return id, nil
+	}
+	return d.ID, nil
+}
+
+// TouchDevice uses the `_id` index.
+func (r *mongoRepo) TouchDevice(ctx context.Context, id bson.ObjectID, at time.Time) error {
+	if _, err := r.devices.UpdateByID(ctx, id, bson.M{"$set": bson.M{"last_registered_at": at}}); err != nil {
+		return fmt.Errorf("notification: touch device: %w", err)
+	}
+	return nil
+}
+
+// DeleteDevice uses the `_id` index.
+func (r *mongoRepo) DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, error) {
+	res, err := r.devices.DeleteOne(ctx, bson.M{"_id": id})
+	if err != nil {
+		return false, fmt.Errorf("notification: delete device: %w", err)
+	}
+	return res.DeletedCount > 0, nil
+}
+
+func (r *mongoRepo) findDevice(ctx context.Context, filter bson.M) (Device, bool, error) {
+	var d Device
+	err := r.devices.FindOne(ctx, filter).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return Device{}, false, nil
+	}
+	if err != nil {
+		return Device{}, false, fmt.Errorf("notification: find device: %w", err)
+	}
+	return d, true, nil
+}
+
+// Write inserts e; audit_key is unique (index `audit_dedupe`), so a duplicate is a retried write.
+func (w *mongoAuditWriter) Write(ctx context.Context, e AuditLog) error {
+	_, err := w.coll.InsertOne(ctx, e)
+	if err == nil {
+		return nil
+	}
+	if e.AuditKey != "" && mongo.IsDuplicateKeyError(err) {
+		return errAuditRecorded
+	}
+	return fmt.Errorf("notification: insert audit: %w", err)
 }
 
 func buildFeedFilter(userID bson.ObjectID, tab Tab, after feedCursor) bson.M {
@@ -92,4 +172,30 @@ func buildOwnerFilter(userID bson.ObjectID, tab Tab) bson.M {
 		filter["tab"] = tab
 	}
 	return filter
+}
+
+func buildDeviceKeyFilter(userID bson.ObjectID, deviceID string) bson.M {
+	return bson.M{"user_id": userID, "device_id": deviceID}
+}
+
+// buildDeviceUpsert sets the registration fields; created_* are insert-only (mongo.md §6) and an
+// empty app_version is removed rather than stored as "".
+func buildDeviceUpsert(d Device) bson.M {
+	set := bson.M{
+		"platform":           d.Platform,
+		"token":              d.Token,
+		"last_registered_at": d.LastRegisteredAt,
+		"updated_at":         d.UpdatedAt,
+		"updated_by":         d.UpdatedBy,
+	}
+	update := bson.M{
+		"$set":         set,
+		"$setOnInsert": bson.M{"created_at": d.CreatedAt, "created_by": d.CreatedBy},
+	}
+	if d.AppVersion == "" {
+		update["$unset"] = bson.M{"app_version": ""}
+	} else {
+		set["app_version"] = d.AppVersion
+	}
+	return update
 }

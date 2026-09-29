@@ -99,6 +99,7 @@ check "GET /readiness → 200 (mongo + valkey pinged)" 200 GET /readiness
 check "GET /nope → 404 envelope" 404 GET /nope .code ROUTE_NOT_FOUND
 check "GET /api/v1/nope → 404 through throttle + idempotency" 404 GET /api/v1/nope .code ROUTE_NOT_FOUND
 check "GET /api/v1/notifications without token → 401" 401 GET /api/v1/notifications .code AUTH_TOKEN_MISSING
+check "PUT /api/v1/devices/x without token → 401" 401 PUT /api/v1/devices/x .code AUTH_TOKEN_MISSING
 check "POST /healthcheck → 405 envelope" 405 POST /healthcheck .code METHOD_NOT_ALLOWED
 
 if curl -sI "${BASE}/liveness" | grep -qi '^request-id:'; then
