@@ -1,0 +1,158 @@
+name: go-service-template-local
+
+# Default `make compose-up` brings up mongo + valkey only (fast, ~5s).
+# Kafka stack is opt-in via the "kafka" profile — `make compose-up-kafka`.
+# Observability is provided by the SigNoz stack via a separate compose file —
+# `make compose-up-signoz` brings everything up; `docker-compose.signoz.yml`
+# adds the OTel collector + ClickHouse + Grafana-shaped UI on :8080.
+
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet","rs0","--bind_ip_all","--port","27017"]
+    ports: ["27018:27017"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: >
+        bash -c 'mongosh --quiet --eval "
+          try { rs.status().ok } catch (e) {
+            rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"mongo:27017\"}]}).ok
+          }" | grep -q 1'
+      interval: 5s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    ports: ["6382:6379"]
+    volumes: [valkey-data:/data]
+    healthcheck: { test: ["CMD","valkey-cli","ping"], interval: 5s, retries: 10 }
+
+  app:
+    build: { context: ., args: { VERSION: "${VERSION:-dev}", COMMIT: "${COMMIT:-local}" } }
+    ports: ["7991:7991"]
+    environment:
+      APP_ENV: local
+      SVC_HTTP_PORT: 7991
+      SVC_LOG_LEVEL: debug
+      SVC_MONGO_URI: "mongodb://mongo:27017/?replicaSet=rs0&directConnection=true"
+      SVC_MONGO_DATABASE: service
+      SVC_VALKEY_ADDR: "valkey:6379"
+      # OTel: NOT set here on purpose. With OTEL_EXPORTER_OTLP_ENDPOINT unset,
+      # otelx.Setup goes into "local-only" mode (spans created for log↔trace
+      # correlation, but nothing exported). `make compose-up-signoz` adds
+      # the endpoint via docker-compose.signoz.yml so the app ships OTLP to
+      # the SigNoz collector when the observability stack is up.
+      OTEL_SERVICE_NAME: go-service-template
+    depends_on:
+      mongo:  { condition: service_healthy }
+      valkey: { condition: service_healthy }
+
+  # ----- Kafka stack (opt-in: --profile kafka) -----
+  #
+  # Mirrors the existing Everfit Kafka topology (Zookeeper + 3 brokers + UI).
+  # Each broker advertises ${HOST_IP:-127.0.0.1}:<host_port> so a Go client
+  # running on the host reaches it via localhost. Override HOST_IP only if
+  # you're connecting from another machine on the LAN.
+  #
+  # NOTE — if you ever run `app` inside compose AND need Kafka, switch to
+  # dual listeners (INTERNAL://kafka-N:9092 for in-compose, EXTERNAL://host:port
+  # for host clients). Single-listener config below works fine for `go run`
+  # from the host, which is the current local dev mode.
+
+  zookeeper:
+    image: wurstmeister/zookeeper
+    profiles: ["kafka"]
+    ports: ["2181:2181"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q Mode"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  kafka-1:
+    image: wurstmeister/kafka
+    profiles: ["kafka"]
+    ports: ["9095:9092"]
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: ${HOST_IP:-127.0.0.1}
+      KAFKA_ADVERTISED_PORT: 9095
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 500
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kafka-2:
+    image: wurstmeister/kafka
+    profiles: ["kafka"]
+    ports: ["9096:9092"]
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: ${HOST_IP:-127.0.0.1}
+      KAFKA_ADVERTISED_PORT: 9096
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 501
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kafka-3:
+    image: wurstmeister/kafka
+    profiles: ["kafka"]
+    ports: ["9097:9092"]
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: ${HOST_IP:-127.0.0.1}
+      KAFKA_ADVERTISED_PORT: 9097
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 502
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui
+    profiles: ["kafka"]
+    ports: ["8081:8080"]
+    depends_on:
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+    restart: unless-stopped
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+volumes:
+  mongo-data: {}
+  valkey-data: {}

@@ -1,0 +1,32 @@
+## Git hooks — install with `make hooks` (runs `lefthook install`).
+##
+## Pre-commit: fast static checks. <2s typical.
+## Pre-push:   full unit suite with race detector.
+##
+## Integration tests are NOT in pre-push — they need docker compose running.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.go"
+      run: |
+        out=$(gofmt -l {staged_files})
+        if [ -n "$out" ]; then
+          echo "gofmt issues in:"
+          echo "$out"
+          echo
+          echo "Run: make fmt"
+          exit 1
+        fi
+    vet:
+      glob: "*.go"
+      run: go vet ./...
+    lint:
+      glob: "*.go"
+      run: golangci-lint run
+
+pre-push:
+  commands:
+    test:
+      run: go test -race -short ./...

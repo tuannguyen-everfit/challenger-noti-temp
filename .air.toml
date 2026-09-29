@@ -1,0 +1,33 @@
+# air config for `make run` — hot reload for ./cmd/server.
+# Tool: github.com/air-verse/air (installed on demand by `make run`).
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # Dev binary — skip the -ldflags version stamping used by `make build`; not
+  # worth the rebuild cost on every save.
+  cmd = "go build -o ./tmp/main ./cmd/server"
+  bin = "./tmp/main"
+  # mise auto-loads mise.local.toml in this directory, so env (SVC_*)
+  # carries through to the spawned binary without extra wiring here.
+  include_ext = ["go"]
+  include_dir = ["cmd", "internal"]
+  exclude_dir = ["bin", "tmp", "docs", "signoz", ".git", ".claude", ".github", "node_modules"]
+  # Don't rebuild on test-only edits — _test.go files don't compile into the binary.
+  exclude_regex = ["_test\\.go$"]
+  # Debounce rapid editor saves (e.g. format-on-save firing twice).
+  delay = 500   # ms
+  # Stop early if the build fails — keep the previous binary running until fixed.
+  stop_on_error = true
+  # Graceful shutdown: send SIGINT, then wait long enough for the server's
+  # shutdown sequence (HTTP drain → OTel flush → Mongo close) to finish before
+  # SIGKILL. See .claude/rules/concurrency.md §5.
+  send_interrupt = true
+  kill_delay = "5s"
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true

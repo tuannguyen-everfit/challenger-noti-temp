@@ -1,0 +1,113 @@
+package httpx
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
+	"github.com/Everfit-io/go-service-template/internal/platform/httpx/health"
+	"github.com/Everfit-io/go-service-template/internal/platform/localization"
+)
+
+// stubPinger is a Pinger that always succeeds — enough for health.New.
+type stubPinger struct{}
+
+func (stubPinger) Ping(context.Context) error { return nil }
+
+// noopIdempotencyCache lets us construct NewRouter without a real Valkey.
+// It never reports a cache hit, so Idempotency middleware always falls through
+// to the wrapped handler. Set is a no-op.
+type noopIdempotencyCache struct{}
+
+func (noopIdempotencyCache) Get(context.Context, string) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (noopIdempotencyCache) Set(context.Context, string, []byte, time.Duration) error {
+	return nil
+}
+
+// newTestRouter constructs the real NewRouter with minimal viable deps. With
+// no features mounted, only the health probes and the 404/405 fallbacks are
+// exercised — which is all this file tests.
+func newTestRouter(t *testing.T) http.Handler {
+	t.Helper()
+	return NewRouter(RouterDeps{
+		Health:                 health.New(stubPinger{}, stubPinger{}, health.Meta{}),
+		IdempotencyCache:       noopIdempotencyCache{},
+		HTTPTimeout:            5 * time.Second,
+		ThrottleMax:            10,
+		ThrottleBacklog:        20,
+		ThrottleBacklogTimeout: time.Second,
+	})
+}
+
+func TestNewRouter_Healthcheck_200(t *testing.T) {
+	w := httptest.NewRecorder()
+	newTestRouter(t).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthcheck", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestNewRouter_Liveness_200(t *testing.T) {
+	w := httptest.NewRecorder()
+	newTestRouter(t).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/liveness", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestNewRouter_404_ReturnsJSONEnvelope(t *testing.T) {
+	w := httptest.NewRecorder()
+	newTestRouter(t).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body not JSON: %q (err: %v)", w.Body.String(), err)
+	}
+	if body.Code != "ROUTE_NOT_FOUND" {
+		t.Errorf("code = %q, want ROUTE_NOT_FOUND", body.Code)
+	}
+}
+
+func TestNewRouter_405_ReturnsJSONEnvelope(t *testing.T) {
+	w := httptest.NewRecorder()
+	// POST on /healthcheck (only GET is registered) → chi MethodNotAllowed.
+	newTestRouter(t).ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/healthcheck", nil))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", w.Code)
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body not JSON: %q (err: %v)", w.Body.String(), err)
+	}
+	if body.Code != "METHOD_NOT_ALLOWED" {
+		t.Errorf("code = %q, want METHOD_NOT_ALLOWED", body.Code)
+	}
+}
+
+func TestMethodNotAllowed_HandlerDriven_HasAllowHeader(t *testing.T) {
+	// Constructor-level sanity: apperr.MethodNotAllowed(..., methods...) carries
+	// Allow on the AppError. The chi router test above covers the fallback path
+	// (which can't supply Allow); this confirms the explicit path.
+	err := apperr.MethodNotAllowed(localization.CodeMethodNotAllowed, "manual", "GET", "PUT")
+	if got := err.Headers.Get("Allow"); got != "GET, PUT" {
+		t.Errorf("Allow = %q, want GET, PUT", got)
+	}
+}

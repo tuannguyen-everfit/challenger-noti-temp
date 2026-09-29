@@ -1,0 +1,76 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - gocritic
+    - gocyclo
+    - revive
+    - misspell
+    - unconvert
+    - unparam
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - nilerr
+    - prealloc
+    - sqlclosecheck
+    - rowserrcheck
+    - noctx
+    - durationcheck
+    - exhaustive
+    - copyloopvar
+    - intrange
+    - nestif
+  settings:
+    gocyclo:
+      min-complexity: 15
+    nestif:
+      min-complexity: 5
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    revive:
+      rules:
+        - name: var-naming
+        - name: exported
+        - name: error-return
+        - name: error-naming
+        - name: errorf
+        - name: if-return
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - gocyclo
+          - noctx
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Everfit-io/go-service-template
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install tools (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: gofmt
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "::error::gofmt issues:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        run: golangci-lint run
+
+      - name: build
+        run: go build ./...
+
+      - name: unit tests + coverage gate
+        run: make coverage COVERAGE_FLOOR=45
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install tools (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: start compose stack
+        run: make compose-up
+
+      - name: integration tests
+        env:
+          SVC_MONGO_URI: "mongodb://localhost:27018/?replicaSet=rs0&directConnection=true"
+          SVC_VALKEY_ADDR: "localhost:6382"
+        run: make test-integration
+
+      - name: dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.local.yml logs --tail=200
+
+      - name: teardown
+        if: always()
+        run: docker compose -f docker-compose.local.yml down -v

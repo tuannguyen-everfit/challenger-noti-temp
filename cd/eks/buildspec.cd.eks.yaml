@@ -1,0 +1,107 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      # Install tools
+      - uname -m
+      - yum update -y
+      - curl -sSL -o /tmp/argocd-${ARGOCD_VERSION} https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-arm64
+      - chmod +x /tmp/argocd-${ARGOCD_VERSION}
+      - mv /tmp/argocd-${ARGOCD_VERSION} /usr/local/bin/argocd
+      - argocd version --client
+      # Install yq
+      - wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_arm64
+      - chmod a+x /usr/local/bin/yq
+      - yq --version
+
+  pre_build:
+    commands:
+      - set -e
+      - cd $SERVICE_LOCATION
+      # Retrieve SSH key from AWS Secrets Manager
+      - mkdir -p /root/.ssh
+      - GITOPS_PRIVATE_KEY=$(cat gitops-private-key.pem)
+      - echo "$GITOPS_PRIVATE_KEY" > /root/.ssh/id_rsa
+      - chmod 600 /root/.ssh/id_rsa
+      - ssh-keyscan github.com >> /root/.ssh/known_hosts
+      - GITOPS_PATH=chart/$KIND/$RAW_SERVICE_NAME/values/$ENVIRONMENT/$CLUSTER_TYPE
+      - echo "Retrieving output from ci process..."
+      - REPOSITORY_URL=$(grep REPOSITORY_URL imageinfo.txt | cut -d '=' -f2)
+      - IMAGE_TAG=$(grep IMAGE_TAG imageinfo.txt | cut -d '=' -f2)
+      - COMMIT_ID=$(grep COMMIT_ID imageinfo.txt | cut -d '=' -f2)
+
+  build:
+    commands:
+      - set -e
+      - git clone $GITOPS_REPO_URL
+      - cd $GITOPS_REPO
+      - git checkout $GITOPS_BRANCH
+      # Configure git
+      - git config --global user.email "$GIT_USER_EMAIL"
+      - git config --global user.name "$GIT_USER_NAME"
+      - SUBFILE=$(ls $GITOPS_PATH)
+      # Update kustomization.yaml
+      - |
+        for FILE in $SUBFILE; do
+          yq e '.imageName = "'"$REPOSITORY_URL"'"' -i "$GITOPS_PATH/$FILE"
+          yq e '.imageTag = "'"$IMAGE_TAG"'"' -i "$GITOPS_PATH/$FILE"
+          git add $GITOPS_PATH/$FILE
+        done
+      - git status
+      - git commit -m "Update image tag of $SERVICE_NAME to $IMAGE_TAG at $(date +'%Y-%m-%d %H:%m:%S'), commit id => $COMMIT_ID"
+      - git pull origin $GITOPS_BRANCH
+      - git push origin $GITOPS_BRANCH
+
+      # Argocd sync app
+      - argocd login ${ARGO_CD_HOST} --username ${ARGO_CD_USER} --password ${ARGO_CD_PASSWORD}
+      - echo Syncing applications in ApplicationSet
+      - APP_PARTTEN="$RAW_SERVICE_NAME-worker-$ENV"
+      - |
+        APPLICATIONS=$(argocd app list -o name | grep "$APP_PARTTEN")
+        for app in $APPLICATIONS; do
+          {
+            echo "Syncing application: $app"
+            argocd app get $app --grpc-web
+            if [ $? -ne 0 ]; then
+              echo "Failed to get application: $app"
+              exit 1
+            fi
+            argocd app sync $app --prune --grpc-web
+            if [ $? -ne 0 ]; then
+              echo "Failed to sync application: $app"
+              exit 1
+            fi
+          }
+        done
+      - |
+        for app in $APPLICATIONS; do
+          {
+            echo "Checking health status of application: $app"
+            while true; do
+              HEALTH_STATUS=$(argocd app get $app --grpc-web -o json | jq -r '.status.health.status')
+
+              if [ "$HEALTH_STATUS" == "Healthy" ]; then
+                echo "Application $app is healthy!"
+                break
+              elif [ "$HEALTH_STATUS" == "Progressing" ]; then
+                echo "Application $app is still progressing. Waiting..."
+              elif [ "$HEALTH_STATUS" == "Degraded" ] || [ "$HEALTH_STATUS" == "Missing" ]; then
+                echo "Application $app is in a critical state: $HEALTH_STATUS! Exiting..."
+                exit 1
+              elif [ "$HEALTH_STATUS" == "Suspended" ]; then
+                echo "Application $app is suspended!"
+              elif [ "$HEALTH_STATUS" == "Unknown" ]; then
+                echo "Application $app has an unknown status! Exiting..."
+                exit 1
+              else
+                echo "Application $app is in $HEALTH_STATUS status. Waiting..."
+              fi
+              sleep 30
+            done
+          }
+        done
+
+  post_build:
+    commands:
+      - rm -rf gitops

@@ -1,0 +1,9 @@
+.git
+.idea
+.vscode
+bin/
+dist/
+docs/
+*.md
+.env*
+mise.local.toml

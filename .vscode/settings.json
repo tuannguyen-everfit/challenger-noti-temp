@@ -1,0 +1,75 @@
+{
+  // -------- Go --------
+  // gofmt enforces tabs; this section just controls VS Code's visual rendering
+  // and on-save behavior. File bytes still contain tabs (matches gofmt + CI).
+  "[go]": {
+    "editor.tabSize": 2,
+    "editor.insertSpaces": false,
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "golang.go"
+  },
+
+  // Use goimports (gofmt + import grouping) rather than plain gofmt.
+  "go.formatTool": "goimports",
+  "go.formatFlags": ["-local", "github.com/Everfit-io/go-service-template"],
+
+  // Lint with golangci-lint (matches `make lint`). On-save = current package
+  // only; full repo lint runs in CI.
+  "go.lintTool": "golangci-lint",
+  "go.lintOnSave": "package",
+  "go.lintFlags": ["--fast"],
+
+  // Language server (gopls) — the source of truth for completion, hover, and
+  // auto-organize-imports. Don't disable.
+  "go.useLanguageServer": true,
+  "go.toolsManagement.autoUpdate": false,
+
+  // gopls knobs — staticcheck on, semantic tokens for highlighting.
+  "gopls": {
+    "ui.semanticTokens": true,
+    "ui.diagnostic.staticcheck": true,
+    "ui.codelenses": {
+      "generate": false,
+      "test": true,
+      "tidy": true,
+      "vendor": false
+    }
+  },
+
+  // Run tests via `go test -race` so race conditions surface during local dev.
+  "go.testFlags": ["-race"],
+  "go.testTimeout": "60s",
+  "go.coverOnSave": false,
+  "go.coverOnSingleTest": true,
+
+  // -------- Makefile --------
+  // Makefile recipe lines REQUIRE tabs (syntax). Match Go tab-width for visual
+  // consistency.
+  "[makefile]": {
+    "editor.tabSize": 2,
+    "editor.insertSpaces": false,
+    "editor.detectIndentation": false
+  },
+
+  // -------- Project-wide --------
+  // Trim trailing whitespace + newline at EOF, matching .editorconfig.
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+
+  // Ignore generated + build artifacts in the file explorer.
+  "files.exclude": {
+    "bin": true,
+    "coverage.out": true,
+    "coverage.html": true
+  },
+  "search.exclude": {
+    "bin": true,
+    "go.sum": true,
+    "coverage.out": true
+  }
+}

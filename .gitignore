@@ -1,0 +1,59 @@
+# Env / per-developer overrides
+# (No inline comments — gitignore reads "# ..." as part of the pattern.)
+.env*
+!.env.test
+# mise.local.toml is per-developer; copy from mise.local.example.toml.
+mise.local.toml
+
+# Secrets — private keys and any other PEM/key material never get committed.
+*.pem
+*.key
+
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.out
+coverage.html
+coverage_integration.out
+
+# air hot-reload (make run) build scratch dir
+/tmp/
+
+# Editors / OS
+.idea/
+# .vscode is mostly gitignored — but commit the shared workspace config so
+# teammates inherit Go settings, recommended extensions, debug launches.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+*.swp
+.DS_Store
+docker-compose.override.yml
+api.http
+api.postman_collection.json
+
+# SigNoz init-clickhouse downloads the histogramQuantile UDF binary into this
+# directory on every boot (wget from GitHub Releases — see signoz/docker-compose.yml).
+# Don't track it: 1.5MB of generated content that would churn on rebuilds.
+signoz/common/clickhouse/user_scripts/*
+!signoz/common/clickhouse/user_scripts/.gitkeep
+
+# Per-developer AI-assistant working dirs: planning notes, solution-design
+# drafts, self-review reports. These are personal artifacts of the dev's
+# workflow, not shared team docs. Genuinely shared docs live elsewhere
+# (CLAUDE.md, .claude/rules/, README, etc.).
+plans/
+output-ai-agents/
+
+# build artifact (go build -o server)
+/server
+.claude/scheduled_tasks.lock
+
+# AI tooling output (not part of the repo)
+ai-agents-output/
+
+# superpowers SDD scratch (ledger, briefs, review packages) — never committed
+.superpowers/

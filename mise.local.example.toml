@@ -1,0 +1,97 @@
+# Per-developer mise overrides. COPY this file to `mise.local.toml` and edit:
+#
+#     cp mise.local.example.toml mise.local.toml
+#
+# `mise.local.toml` is gitignored — never commit personal credentials or hosts
+# from it. mise auto-loads it whenever it's active in this directory, so
+# `go run`, `make`, and tests all inherit these without manual `export`.
+#
+# Every SVC_* var corresponds to a field in internal/platform/config.
+# Every OTEL_* var is part of the OpenTelemetry SDK spec — read directly by
+# internal/infra/otelx (no SVC_ prefix).
+
+[env]
+# --- Required ---
+SVC_MONGO_URI    = "mongodb://localhost:27018/?replicaSet=rs0&directConnection=true"
+SVC_VALKEY_ADDR  = "localhost:6382"
+
+# --- App-specific (defaults shown — uncomment + edit to override) ---
+SVC_HTTP_PORT          = "7991"
+# Identity surfaced in GET /healthcheck (app_name / app_env / app_region).
+# Override per deploy (e.g. go-service-template-api-stg / stg / us-west-2).
+# app_env also feeds OTel deployment.environment; app_version reuses the
+# embedded VERSION file.
+APP_NAME                      = "go-service-template"
+APP_ENV                       = "local"
+APP_REGION                    = "ap-southeast-1"
+SVC_LOG_LEVEL          = "debug"
+SVC_LOG_FORMAT         = "json"
+
+# --- Payload capture (debugging only) -----------------------------------
+# OFF by default. See .claude/rules/logging.md §6 before turning any of it on.
+# Bodies are captured for application/json ONLY, and every value whose key
+# looks sensitive (password / token / email / identifier / ...) is replaced
+# with [REDACTED] before it reaches the log. Headers and query params are
+# ALLOWLISTS — empty means nothing is logged.
+#
+# Turn on for a session, then turn it back off: capture raises log volume and
+# widens the blast radius if the redaction list misses a new field name.
+# SVC_HTTP_LOG_BODIES     = "true"
+# SVC_HTTP_LOG_MAX_VALUE_LEN = "512"
+# SVC_HTTP_LOG_MAX_FIELDS    = "200"
+# SVC_HTTP_LOG_HEADERS    = "Content-Type,Accept,User-Agent"
+# SVC_HTTP_LOG_QUERY      = "true"
+# SVC_HTTP_LOG_QUERY_DENY = "secret,sig,signature"
+SVC_MONGO_DATABASE     = "service"
+SVC_MONGO_PING_TIMEOUT = "5s"
+SVC_VALKEY_PASSWORD    = ""
+SVC_VALKEY_DB          = "0"
+# Empty = Kafka disabled; comma-separated brokers enables the producer.
+# SVC_KAFKA_BROKERS    = "localhost:9095,localhost:9096,localhost:9097"
+# Topic prefix — MUST match the target MSK cluster's AWS_MSK_PREFIX
+# (dev / staging / prod). The real broker topic is "<prefix>-<topic>";
+# a mismatch silently subscribes to a topic no producer writes to. Default "dev".
+# SVC_KAFKA_TOPIC_PREFIX = "dev"
+
+# Global per-request HTTP timeout. Override per-route via r.With(middleware.Timeout).
+SVC_HTTP_TIMEOUT       = "30s"
+
+SVC_SHUTDOWN_TIMEOUT   = "15s"
+
+# JWT session tokens (platform/authtoken). BOTH set → Bearer-authed routes
+# are mounted; either empty → the authed group is off.
+# SVC_AUTH_JWT_ACCESS_SECRET  = "local-access-secret"
+# SVC_AUTH_JWT_REFRESH_SECRET = "local-refresh-secret"
+# SVC_AUTH_JWT_ACCESS_TTL     = "1h"
+# SVC_AUTH_JWT_REFRESH_TTL    = "720h"
+
+# Shared pagination ceiling — applies to `?limit=` on EVERY list endpoint
+# Each feature's Service rejects
+# oversized requests with 400 (handler validator only enforces min=1).
+# SVC_PAGINATION_MAX_LIMIT = "100"
+
+# --- OpenTelemetry (spec-standard env vars; NOT SVC_OTEL_*) ---
+# OTel is DISABLED until OTEL_EXPORTER_OTLP_ENDPOINT is set.
+#
+# Local quickstart — `make compose-up-signoz` brings up the SigNoz stack
+# (traces + metrics + logs in a Datadog-shaped UI) alongside our service.
+# The app inside compose ships OTLP via the docker-compose.signoz.yml
+# override, so these env vars are only needed if you run via `go run`
+# from the host while SigNoz is up:
+#
+#     make compose-up-signoz                     # mongo + valkey + app + SigNoz
+#     open http://localhost:8080                 # SigNoz UI (create local admin)
+#
+# Or run the binary from the host (uncomment the two lines below):
+#
+#     make compose-up-signoz                     # SigNoz only; app via go run
+#     OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 go run ./cmd/server
+#
+# OTEL_EXPORTER_OTLP_ENDPOINT     = "http://localhost:4318"  # default http/protobuf; use 4317 with PROTOCOL=grpc
+# OTEL_EXPORTER_OTLP_PROTOCOL     = "http/protobuf"      # or "grpc"; default http/protobuf
+# OTEL_EXPORTER_OTLP_INSECURE     = "true"               # PLAINTEXT for local
+OTEL_SERVICE_NAME                 = "go-service-template"
+# OTEL_SERVICE_VERSION            = "0.1.0"              # fallback: buildinfo VERSION file
+# OTEL_ENVIRONMENT                = "local"              # or NODE_ENV; fallback: APP_ENV
+OTEL_TRACES_SAMPLER_ARG           = "1.0"                # 0..1 (1.0 dev, 0.1 prod typical)
+OTEL_METRIC_EXPORT_INTERVAL_MILLIS = "60000"             # default 60s

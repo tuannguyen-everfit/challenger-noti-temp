@@ -1,0 +1,47 @@
+# This is a buildspec file for AWS CodeBuild.
+
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - uname -m
+      # Check if docker is installed
+      - docker --version
+
+  pre_build:
+    commands:
+      - cd $SERVICE_LOCATION
+      # Pull secret files
+      - aws s3 cp s3://$SECRET_BUCKET_NAME/$ENV/ . --recursive
+      - "[ -d api/microservices/common ] && mv api/microservices/common/* . || true"
+      - "[ -d api/microservices/${RAW_SERVICE_NAME} ] && mv api/microservices/${RAW_SERVICE_NAME}/* . || true"
+      - ls -al | grep json
+      - ls -al | grep .npmrc
+      - ls -al | grep gitops-private-key
+
+  build:
+    commands:
+      # Build and Push container image to ECR using docker buildx bake
+      # Login to ECR
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPOSITORY_URL
+      - IMAGE_TAG="$CODEBUILD_BUILD_NUMBER.$(date +%Y%m%d%H%m)"
+      - echo $IMAGE_TAG
+      - VERSION=$(cat internal/platform/buildinfo/VERSION 2>/dev/null | tr -d '[:space:]' || echo dev)
+      - COMMIT=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+      - echo $COMMIT
+      - echo $VERSION
+      # Setup docker buildx for multi-platform builds
+      - docker buildx create --use --name multiarch-builder --driver docker-container || docker buildx use multiarch-builder
+      - docker buildx inspect --bootstrap
+      - docker buildx build --platform $DOCKER_BUILD_PLATFORM --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT -t $REPOSITORY_URL:$IMAGE_TAG -t $REPOSITORY_URL:latest --push .
+      - COMMIT_ID=${CODEBUILD_RESOLVED_SOURCE_VERSION}
+      - echo "REPOSITORY_URL=$REPOSITORY_URL" > imageinfo.txt
+      - echo "IMAGE_TAG=$IMAGE_TAG" >> imageinfo.txt
+      - echo "COMMIT_ID=$COMMIT_ID" >> imageinfo.txt
+
+artifacts:
+  files:
+    - imageinfo.txt
+    - cd/eks/buildspec.cd.eks.yaml
+    - gitops-private-key.pem

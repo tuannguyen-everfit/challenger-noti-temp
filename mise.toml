@@ -1,0 +1,22 @@
+# Shared, committed mise config.
+#  - Tool versions live here (everyone gets the same toolchain).
+#  - Project-wide env that's safe to commit (e.g. CGO_ENABLED) lives here too.
+#
+# Personal / machine-local env (SVC_MONGO_URI, etc.) goes into
+# `mise.local.toml` — gitignored. See `mise.local.example.toml` for a template:
+#
+#     cp mise.local.example.toml mise.local.toml
+#
+# mise auto-loads `mise.local.toml` whenever it's active in this directory.
+
+[tools]
+go            = "1.25"
+golangci-lint = "2.12.2"
+lefthook      = "1.10.10"
+# air — file watcher for `make run` (hot reload of cmd/server). Config in .air.toml.
+air           = "1.65.3"
+# gotestsum — pretty per-package test output for `make test`. Wraps `go test`.
+gotestsum     = "1.13.0"
+
+[env]
+CGO_ENABLED = "0"

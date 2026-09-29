@@ -1,0 +1,11 @@
+{
+  // VS Code prompts contributors to install these on first open. Keep the
+  // list minimal — only the ones that make this repo's workflow work.
+  "recommendations": [
+    "golang.go",
+    "editorconfig.editorconfig"
+  ],
+  // Extensions to flag as discouraged in this workspace (none right now —
+  // keep the field documented for future use).
+  "unwantedRecommendations": []
+}

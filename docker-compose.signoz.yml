@@ -1,0 +1,55 @@
+# Compose override applied on top of docker-compose.local.yml +
+# signoz/docker-compose.yml. Together they bring up our service alongside
+# the vendored SigNoz stack (Datadog-like UX, fully self-hosted, no API key).
+#
+# Usage (via Makefile):
+#   make compose-up-signoz   # mongo + valkey + app + the full SigNoz stack
+#   open http://localhost:8080
+#   # first visit asks you to create a local admin account — stored in
+#   # SigNoz's sqlite volume; no internet call, no API key required.
+#
+# When this profile is up, the app ships OTLP traces+metrics+logs to the
+# SigNoz collector.
+#
+# Network: SigNoz services declare `signoz-net`; this override attaches
+# the app to that same network so it can DNS-resolve `otel-collector`.
+services:
+  # Pin SigNoz image tags explicitly — the vendored compose uses ${VERSION:-...}
+  # which our Makefile sets to our app's version (e.g. 0.1.0), and that's NOT
+  # a valid SigNoz tag. Override here so OUR VERSION env can't bleed into SigNoz.
+  signoz:
+    image: signoz/signoz:v0.124.0
+  otel-collector:
+    image: signoz/signoz-otel-collector:v0.144.4
+  signoz-telemetrystore-migrator:
+    image: signoz/signoz-otel-collector:v0.144.4
+
+  app:
+    environment:
+      # Point at SigNoz's collector (in-network DNS). Spec requires the
+      # http:// scheme — bare host:port gets parsed as an empty gRPC target.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_SERVICE_NAME: go-service-template
+    networks:
+      - default
+      - signoz-net
+    depends_on:
+      # Only block on mongo + valkey (they have healthchecks). The SigNoz
+      # collector doesn't ship one and the OTel SDK retries silently anyway,
+      # so a not-yet-ready collector at boot just means the first few exports
+      # drop until it comes up.
+      mongo:  { condition: service_healthy }
+      valkey: { condition: service_healthy }
+
+  mongo:
+    networks:
+      - default
+
+  valkey:
+    networks:
+      - default
+
+networks:
+  signoz-net:
+    external: false
