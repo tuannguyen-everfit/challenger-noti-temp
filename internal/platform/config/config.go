@@ -45,9 +45,8 @@ type PaginationConfig struct {
 	MaxLimit int `mapstructure:"max_limit"` // SVC_PAGINATION_MAX_LIMIT, default 100
 }
 
-// AuthConfig holds the JWT secrets for platform/authtoken. Opt-in: when
-// either secret is empty the signer is not built and Bearer-authed routes are
-// not mounted.
+// AuthConfig holds the JWT secrets for platform/authtoken. Both secrets are
+// required at boot (validate) because every route this service serves is authed.
 type AuthConfig struct {
 	JWTAccessSecret  string        `mapstructure:"jwt_access_secret"`  // SVC_AUTH_JWT_ACCESS_SECRET
 	JWTRefreshSecret string        `mapstructure:"jwt_refresh_secret"` // SVC_AUTH_JWT_REFRESH_SECRET
@@ -238,6 +237,10 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Valkey.Addr == "" {
 		return fmt.Errorf("config: SVC_VALKEY_ADDR is required")
+	}
+	// Every route is Bearer-authed; missing secrets would otherwise surface as 404s.
+	if cfg.Auth.JWTAccessSecret == "" || cfg.Auth.JWTRefreshSecret == "" {
+		return fmt.Errorf("config: SVC_AUTH_JWT_ACCESS_SECRET and SVC_AUTH_JWT_REFRESH_SECRET are required")
 	}
 	if cfg.HTTPTimeout <= 0 {
 		return fmt.Errorf("config: SVC_HTTP_TIMEOUT must be positive (e.g. 30s)")

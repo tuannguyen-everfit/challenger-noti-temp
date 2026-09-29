@@ -3,12 +3,14 @@ package httpx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Everfit-io/go-service-template/internal/features/notification"
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/health"
 	"github.com/Everfit-io/go-service-template/internal/platform/localization"
@@ -32,13 +34,21 @@ func (noopIdempotencyCache) Set(context.Context, string, []byte, time.Duration) 
 	return nil
 }
 
-// newTestRouter constructs the real NewRouter with minimal viable deps. With
-// no features mounted, only the health probes and the 404/405 fallbacks are
-// exercised — which is all this file tests.
+type rejectingVerifier struct{}
+
+func (rejectingVerifier) VerifyAccess(string) (string, error) {
+	return "", errors.New("invalid token")
+}
+
+// newTestRouter constructs the real NewRouter with minimal viable deps. Feature
+// handlers get a nil service: tests here only reach the health probes, the
+// 404/405 fallbacks and the Bearer gate in front of feature mounts.
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
 	return NewRouter(RouterDeps{
 		Health:                 health.New(stubPinger{}, stubPinger{}, health.Meta{}),
+		Notification:           notification.NewHandler(nil),
+		AccessVerifier:         rejectingVerifier{},
 		IdempotencyCache:       noopIdempotencyCache{},
 		HTTPTimeout:            5 * time.Second,
 		ThrottleMax:            10,
@@ -109,5 +119,15 @@ func TestMethodNotAllowed_HandlerDriven_HasAllowHeader(t *testing.T) {
 	err := apperr.MethodNotAllowed(localization.CodeMethodNotAllowed, "manual", "GET", "PUT")
 	if got := err.Headers.Get("Allow"); got != "GET, PUT" {
 		t.Errorf("Allow = %q, want GET, PUT", got)
+	}
+}
+
+func TestNewRouter_Notifications_RequireBearer(t *testing.T) {
+	for _, path := range []string{"/api/v1/notifications", "/api/v1/notifications/summary"} {
+		w := httptest.NewRecorder()
+		newTestRouter(t).ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s status = %d, want 401", path, w.Code)
+		}
 	}
 }

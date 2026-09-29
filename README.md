@@ -74,7 +74,7 @@ See [`CLAUDE.md`](./CLAUDE.md) §3 for the directory layout and the conventions 
 
 ### Features
 
-Add new features under `internal/features/<name>/` following the template in [.claude/rules/layout.md](.claude/rules/layout.md) §2. The template ships with no business features — only health probes, the 404/405 envelope, and an empty Bearer-auth group in `router.go`.
+Add new features under `internal/features/<name>/` following the template in [.claude/rules/layout.md](.claude/rules/layout.md) §2. The template includes the notification feature (GET feed, summary); Bearer auth is always enabled. Add public features in `router.go` under the "Public feature mounts" comment; mount authed features in the BearerAuth group.
 
 ---
 
@@ -98,7 +98,7 @@ All variables use the `SVC_` prefix. For local development copy
 | `SVC_VALKEY_DB`          | `0`          | no       |
 | `SVC_KAFKA_BROKERS`      | (empty)      | no — empty disables Kafka producer + all consumers |
 | `SVC_SHUTDOWN_TIMEOUT`   | `15s`        | no       |
-| `SVC_AUTH_JWT_ACCESS_SECRET` / `SVC_AUTH_JWT_REFRESH_SECRET` | (empty) | no — both set mounts the Bearer-auth group |
+| `SVC_AUTH_JWT_ACCESS_SECRET` / `SVC_AUTH_JWT_REFRESH_SECRET` | — | yes — boot fails without both (every route is Bearer-authed) |
 | `SVC_PAGINATION_MAX_LIMIT` | `100` | no |
 
 `MONGO_URI` must contain `replicaSet=` — enforced at startup to guarantee dev/prod parity for transactions.

@@ -58,10 +58,10 @@ SVC_HTTP_TIMEOUT       = "30s"
 
 SVC_SHUTDOWN_TIMEOUT   = "15s"
 
-# JWT session tokens (platform/authtoken). BOTH set → Bearer-authed routes
-# are mounted; either empty → the authed group is off.
-# SVC_AUTH_JWT_ACCESS_SECRET  = "local-access-secret"
-# SVC_AUTH_JWT_REFRESH_SECRET = "local-refresh-secret"
+# JWT session tokens (platform/authtoken). REQUIRED — every route is
+# Bearer-authed, so boot fails when either secret is empty.
+SVC_AUTH_JWT_ACCESS_SECRET  = "local-access-secret"
+SVC_AUTH_JWT_REFRESH_SECRET = "local-refresh-secret"
 # SVC_AUTH_JWT_ACCESS_TTL     = "1h"
 # SVC_AUTH_JWT_REFRESH_TTL    = "720h"
 
