@@ -1,0 +1,109 @@
+// Server-to-server read API that challenger-service exposes to
+// challenger-notification-service. challenger-service owns this contract; the
+// notification service mirrors the file byte-for-byte. A breaking change is a
+// new v2 package, never an in-place edit (buf breaking guards this in CI).
+syntax = "proto3";
+
+package challenger.internal.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Everfit-io/challenger-service/proto/challenger/internalv1;internalv1";
+
+// ChallengeInternalService serves challenge reads for the notification service.
+// Every RPC requires the internal-api-secret metadata.
+service ChallengeInternalService {
+  // GetChallenge returns the challenge in ANY status, including soft-deleted
+  // (deleted = true). NOT_FOUND only when the id never existed.
+  rpc GetChallenge(GetChallengeRequest) returns (GetChallengeResponse);
+  // ListLifecycleChallenges returns every non-deleted private or publish
+  // challenge whose ends_at is later than now - 24h. Bounded by the number of
+  // live challenges (single digits), so not paginated.
+  rpc ListLifecycleChallenges(ListLifecycleChallengesRequest) returns (ListLifecycleChallengesResponse);
+  // CheckChallengeAccess answers "may this user open the challenge now".
+  rpc CheckChallengeAccess(CheckChallengeAccessRequest) returns (CheckChallengeAccessResponse);
+  // ListNotifySubscriberIDs pages the users who tapped "Notify me" on a
+  // challenge, in subscription order. An unknown challenge has no subscribers.
+  rpc ListNotifySubscriberIDs(ListNotifySubscriberIDsRequest) returns (ListNotifySubscriberIDsResponse);
+}
+
+// ChallengeStatus is the admin-managed publication state.
+enum ChallengeStatus {
+  CHALLENGE_STATUS_UNSPECIFIED = 0;
+  CHALLENGE_STATUS_PRIVATE = 1;
+  CHALLENGE_STATUS_PUBLISH = 2;
+}
+
+// Challenge is the notification-facing view of a challenge.
+message Challenge {
+  // 24-hex ObjectID.
+  string id = 1;
+  string name = 2;
+  ChallengeStatus status = 3;
+  google.protobuf.Timestamp starts_at = 4;
+  google.protobuf.Timestamp ends_at = 5;
+  // CloudFront-rewritten, same as the public API.
+  string thumbnail_url = 6;
+  // New CMS field; falls back to the description until the CMS ships it.
+  string short_description = 7;
+  // New CMS field; falls back to the description until the CMS ships it.
+  string tagline = 8;
+  bool deleted = 9;
+}
+
+// GetChallengeRequest identifies the challenge by its 24-hex ObjectID.
+message GetChallengeRequest {
+  string challenge_id = 1;
+}
+
+// GetChallengeResponse carries the challenge.
+message GetChallengeResponse {
+  Challenge challenge = 1;
+}
+
+// ListLifecycleChallengesRequest takes no filter; the window is server-defined.
+message ListLifecycleChallengesRequest {}
+
+// ListLifecycleChallengesResponse carries the live challenges.
+message ListLifecycleChallengesResponse {
+  repeated Challenge challenges = 1;
+}
+
+// AccessDeniedReason explains why available = false.
+enum AccessDeniedReason {
+  // available = true.
+  ACCESS_DENIED_REASON_UNSPECIFIED = 0;
+  ACCESS_DENIED_REASON_NOT_FOUND = 1;
+  ACCESS_DENIED_REASON_DELETED = 2;
+  ACCESS_DENIED_REASON_NOT_WHITELISTED = 3;
+}
+
+// CheckChallengeAccessRequest pairs a challenge with the user opening it.
+message CheckChallengeAccessRequest {
+  string challenge_id = 1;
+  string user_id = 2;
+}
+
+// ListNotifySubscriberIDsRequest pages one challenge's subscribers.
+message ListNotifySubscriberIDsRequest {
+  string challenge_id = 1;
+  // 0 means 1000; larger values are capped at 1000; negative is rejected.
+  int32 page_size = 2;
+  // Opaque; empty starts from the beginning.
+  string page_token = 3;
+}
+
+// ListNotifySubscriberIDsResponse is one page of subscriber user ids.
+message ListNotifySubscriberIDsResponse {
+  repeated string user_ids = 1;
+  // Empty when there are no more rows.
+  string next_page_token = 2;
+}
+
+// CheckChallengeAccessResponse is the access verdict.
+message CheckChallengeAccessResponse {
+  bool available = 1;
+  AccessDeniedReason reason = 2;
+  // now >= ends_at; the caller navigates to the leaderboard instead of detail.
+  bool ended = 3;
+}

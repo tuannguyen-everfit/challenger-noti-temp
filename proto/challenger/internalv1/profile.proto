@@ -1,0 +1,74 @@
+// Server-to-server read API that challenger-service exposes to
+// challenger-notification-service. challenger-service owns this contract; the
+// notification service mirrors the file byte-for-byte. A breaking change is a
+// new v2 package, never an in-place edit (buf breaking guards this in CI).
+syntax = "proto3";
+
+package challenger.internal.v1;
+
+option go_package = "github.com/Everfit-io/challenger-service/proto/challenger/internalv1;internalv1";
+
+// ProfileInternalService serves profile reads for the notification service.
+// Every RPC requires the internal-api-secret metadata.
+service ProfileInternalService {
+  // ListAccountIDs pages every account on account_id ascending, excluding
+  // accounts with a pending deletion request. A page can hold fewer than
+  // page_size ids (excluded accounts) while next_page_token is set; page on
+  // the token, never on the length.
+  rpc ListAccountIDs(ListAccountIDsRequest) returns (ListAccountIDsResponse);
+  // BatchGetProfiles returns the profiles of up to 500 accounts in request
+  // order. Unknown ids are omitted, not an error; duplicates appear once.
+  rpc BatchGetProfiles(BatchGetProfilesRequest) returns (BatchGetProfilesResponse);
+  // FindProfilesByEmails returns the profiles whose email matches one of up to
+  // 500 emails, case-insensitively, in request order. Unknown emails are
+  // omitted; an email shared by several accounts returns each of them.
+  rpc FindProfilesByEmails(FindProfilesByEmailsRequest) returns (FindProfilesByEmailsResponse);
+}
+
+// Profile is the notification-facing view of a user.
+message Profile {
+  // 24-hex ObjectID of the auth-service account.
+  string account_id = 1;
+  string first_name = 2;
+  // First letter of the last name, upper-cased; empty when there is none.
+  string last_initial = 3;
+  // Stored custom avatar, else the assigned default; never empty.
+  string avatar_url = 4;
+  bool notification_enabled = 5;
+  string email = 6;
+}
+
+// ListAccountIDsRequest pages the account ids.
+message ListAccountIDsRequest {
+  // 0 means 1000; larger values are capped at 1000; negative is rejected.
+  int32 page_size = 1;
+  // Opaque; empty starts from the beginning.
+  string page_token = 2;
+}
+
+// ListAccountIDsResponse is one page of account ids.
+message ListAccountIDsResponse {
+  repeated string account_ids = 1;
+  // Empty when there are no more rows.
+  string next_page_token = 2;
+}
+
+// BatchGetProfilesRequest names the accounts; at most 500 ids.
+message BatchGetProfilesRequest {
+  repeated string account_ids = 1;
+}
+
+// BatchGetProfilesResponse carries the known profiles.
+message BatchGetProfilesResponse {
+  repeated Profile profiles = 1;
+}
+
+// FindProfilesByEmailsRequest names the emails; at most 500.
+message FindProfilesByEmailsRequest {
+  repeated string emails = 1;
+}
+
+// FindProfilesByEmailsResponse carries the matching profiles.
+message FindProfilesByEmailsResponse {
+  repeated Profile profiles = 1;
+}

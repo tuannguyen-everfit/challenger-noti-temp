@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Everfit-io/go-service-template/internal/features/notification"
+	"github.com/Everfit-io/go-service-template/internal/infra/challengerclient"
 	"github.com/Everfit-io/go-service-template/internal/infra/kafka"
 	"github.com/Everfit-io/go-service-template/internal/infra/mongox"
 	"github.com/Everfit-io/go-service-template/internal/infra/otelx"
@@ -69,9 +70,21 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
+	// Lazy dial: boot never waits on challenger; the first mark-read connects.
+	challengerClient, err := challengerclient.New(ctx, challengerclient.Config{
+		Addr:        cfg.Challenger.GRPCAddr,
+		Secret:      cfg.Challenger.GRPCSecret,
+		CallTimeout: cfg.Challenger.GRPCCallTimeout,
+		MaxAttempts: cfg.Challenger.GRPCMaxAttempts,
+	})
+	if err != nil {
+		return fmt.Errorf("app: challenger client: %w", err)
+	}
+
 	notificationSvc := notification.New(
 		notification.NewMongoRepository(mongoClient),
 		notification.NewMongoAuditWriter(mongoClient),
+		challengerClient,
 		notification.Config{MaxListLimit: cfg.Pagination.MaxLimit},
 	)
 	notificationHandler := notification.NewHandler(notificationSvc)
@@ -129,7 +142,7 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("app: http server: %w", err)
 	}
 
-	return shutdown(ctx, cfg.ShutdownTimeout, healthHandler, srv, producer, valkeyClient, mongoClient, otelShutdown, log)
+	return shutdown(ctx, cfg.ShutdownTimeout, healthHandler, srv, producer, challengerClient, valkeyClient, mongoClient, otelShutdown, log)
 }
 
 // newAccessVerifier builds the JWT signer that backs middleware.BearerAuth.
@@ -155,6 +168,7 @@ func shutdown(
 	healthHandler *health.Handler,
 	srv *http.Server,
 	producer kafka.Producer,
+	challengerClient *challengerclient.Client,
 	valkeyClient *valkey.Client,
 	mongoClient *mongox.Client,
 	otelShutdown otelx.ShutdownFunc,
@@ -192,6 +206,10 @@ func shutdown(
 
 	// 6. Outbound clients (gRPC conns) close here, before the OTel flush — a
 	// client may emit a final span on Close.
+	log.Info("closing challenger grpc client")
+	if err := challengerClient.Close(); err != nil {
+		log.Warn("challenger grpc client close error", slog.String("error", err.Error()))
+	}
 
 	// 7. Flush OTel exporter so the last spans land in the collector.
 	log.Info("shutting down otel")

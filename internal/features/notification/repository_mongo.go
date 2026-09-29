@@ -109,6 +109,41 @@ func (r *mongoRepo) DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, e
 	return res.DeletedCount > 0, nil
 }
 
+// FindNotification uses the `_id` index; user_id makes another user's row look absent.
+func (r *mongoRepo) FindNotification(ctx context.Context, userID, id bson.ObjectID) (Notification, bool, error) {
+	var n Notification
+	err := r.coll.FindOne(ctx, bson.M{"_id": id, "user_id": userID}).Decode(&n)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return Notification{}, false, nil
+	}
+	if err != nil {
+		return Notification{}, false, fmt.Errorf("notification: find: %w", err)
+	}
+	return n, true, nil
+}
+
+// UpdateRead uses the `_id` index.
+func (r *mongoRepo) UpdateRead(ctx context.Context, id bson.ObjectID, u readUpdate) error {
+	if _, err := r.coll.UpdateByID(ctx, id, bson.M{"$set": buildReadSet(u)}); err != nil {
+		return fmt.Errorf("notification: update read: %w", err)
+	}
+	return nil
+}
+
+// MarkAllRead uses index `notifications_unread` (both tabs listed so the bounds stay tight).
+func (r *mongoRepo) MarkAllRead(ctx context.Context, userID bson.ObjectID, at time.Time, by Actor) (int64, error) {
+	res, err := r.coll.UpdateMany(ctx, buildMarkAllReadFilter(userID), bson.M{"$set": bson.M{
+		"read_at":     at,
+		"read_action": ReadActionReadAll,
+		"updated_at":  at,
+		"updated_by":  by,
+	}})
+	if err != nil {
+		return 0, fmt.Errorf("notification: mark all read: %w", err)
+	}
+	return res.ModifiedCount, nil
+}
+
 // DeleteNotificationsByUser uses index `notifications_feed` (user_id prefix).
 func (r *mongoRepo) DeleteNotificationsByUser(ctx context.Context, userID bson.ObjectID) (int64, error) {
 	res, err := r.coll.DeleteMany(ctx, bson.M{"user_id": userID})
@@ -216,4 +251,21 @@ func buildDeviceUpsert(d Device) bson.M {
 		set["app_version"] = d.AppVersion
 	}
 	return update
+}
+
+// buildMarkAllReadFilter matches the user's unread rows ($unset / missing read_at) in both tabs.
+func buildMarkAllReadFilter(userID bson.ObjectID) bson.M {
+	return bson.M{"user_id": userID, "tab": bson.M{"$in": bson.A{TabActivities, TabSystem}}, "read_at": nil}
+}
+
+func buildReadSet(u readUpdate) bson.M {
+	set := bson.M{"updated_at": u.UpdatedAt, "updated_by": u.UpdatedBy}
+	if u.ReadAt != nil {
+		set["read_at"] = *u.ReadAt
+		set["read_action"] = u.ReadAction
+	}
+	if u.ButtonsHiddenAt != nil {
+		set["buttons_hidden_at"] = *u.ButtonsHiddenAt
+	}
+	return set
 }

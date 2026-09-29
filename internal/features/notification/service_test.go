@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Everfit-io/go-service-template/internal/infra/challengerclient"
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
 	"github.com/Everfit-io/go-service-template/internal/platform/localization"
@@ -211,6 +213,86 @@ func (m *mockRepo) DeleteDevicesByUser(_ context.Context, userID bson.ObjectID) 
 	return n, nil
 }
 
+func (m *mockRepo) FindNotification(_ context.Context, userID, id bson.ObjectID) (Notification, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.failOn["FindNotification"]; err != nil {
+		return Notification{}, false, err
+	}
+	n, ok := m.notifications[id]
+	if !ok || n.UserID != userID {
+		return Notification{}, false, nil
+	}
+	return n, true, nil
+}
+
+func (m *mockRepo) UpdateRead(_ context.Context, id bson.ObjectID, u readUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.failOn["UpdateRead"]; err != nil {
+		return err
+	}
+	n := m.notifications[id]
+	if u.ReadAt != nil {
+		n.ReadAt, n.ReadAction = u.ReadAt, u.ReadAction
+	}
+	if u.ButtonsHiddenAt != nil {
+		n.ButtonsHiddenAt = u.ButtonsHiddenAt
+	}
+	by := u.UpdatedBy
+	n.UpdatedAt, n.UpdatedBy = u.UpdatedAt, &by
+	m.notifications[id] = n
+	return nil
+}
+
+func (m *mockRepo) MarkAllRead(_ context.Context, userID bson.ObjectID, at time.Time, by Actor) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.failOn["MarkAllRead"]; err != nil {
+		return 0, err
+	}
+	var n int64
+	for id, row := range m.notifications {
+		if row.UserID != userID || row.ReadAt != nil {
+			continue
+		}
+		readAt, actor := at, by
+		row.ReadAt, row.ReadAction, row.UpdatedAt, row.UpdatedBy = &readAt, ReadActionReadAll, at, &actor
+		m.notifications[id] = row
+		n++
+	}
+	return n, nil
+}
+
+// mockChallenges answers GetChallenge / CheckChallengeAccess from maps keyed by challenge id.
+type mockChallenges struct {
+	challenges  map[string]challengerclient.Challenge
+	access      map[string]challengerclient.Access
+	err         error
+	getCalls    int
+	accessCalls []string // "challengeID/userID"
+}
+
+func (m *mockChallenges) GetChallenge(_ context.Context, id string) (challengerclient.Challenge, error) {
+	m.getCalls++
+	if m.err != nil {
+		return challengerclient.Challenge{}, m.err
+	}
+	ch, ok := m.challenges[id]
+	if !ok {
+		return challengerclient.Challenge{}, challengerclient.ErrNotFound
+	}
+	return ch, nil
+}
+
+func (m *mockChallenges) CheckChallengeAccess(_ context.Context, challengeID, userID string) (challengerclient.Access, error) {
+	m.accessCalls = append(m.accessCalls, challengeID+"/"+userID)
+	if m.err != nil {
+		return challengerclient.Access{}, m.err
+	}
+	return m.access[challengeID], nil
+}
+
 // errDuplicateToken is what the unique `devices_token` index would raise.
 var errDuplicateToken = errors.New("mock: duplicate token")
 
@@ -251,9 +333,17 @@ func (m *mockRepo) CountRange(_ context.Context, userID bson.ObjectID, tab Tab, 
 
 func newSvc(now time.Time) (*Service, *mockRepo) {
 	repo := &mockRepo{devices: map[bson.ObjectID]Device{}, notifications: map[bson.ObjectID]Notification{}, audit: &mockAuditWriter{}}
-	svc := New(repo, repo.audit, Config{MaxListLimit: 100})
+	svc := New(repo, repo.audit, &mockChallenges{}, Config{MaxListLimit: 100})
 	svc.now = frozenTime(now)
 	return svc, repo
+}
+
+// newReadSvc is newSvc with the challenger mock returned for the mark-read tests.
+func newReadSvc(now time.Time) (*Service, *mockRepo, *mockChallenges) {
+	svc, repo := newSvc(now)
+	ch := &mockChallenges{challenges: map[string]challengerclient.Challenge{}, access: map[string]challengerclient.Access{}}
+	svc.challenges = ch
+	return svc, repo, ch
 }
 
 // seedDevice stores d as an existing row and returns it with its _id.
@@ -1084,5 +1174,435 @@ func TestRecordAudit_SkipsEmptyPurge(t *testing.T) {
 	}
 	if n := len(repo.audit.snapshot()); n != 0 {
 		t.Errorf("audit entries = %d, want 0 for a purge that deleted nothing", n)
+	}
+}
+
+var readNow = time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+
+// seedCard stores one notification owned by userID pointing at challengeID and returns it.
+func seedCard(t *testing.T, repo *mockRepo, userID bson.ObjectID, challengeID string, buttons ...Button) Notification {
+	t.Helper()
+	n := Notification{
+		ID: bson.NewObjectID(), UserID: userID, Kind: KindChallengePublished, Tab: TabSystem,
+		Navigate: Navigate{Type: NavigateChallengeDetail, ChallengeID: challengeID}, Buttons: buttons,
+		CreatedAt: readNow.Add(-time.Hour), UpdatedAt: readNow.Add(-time.Hour),
+	}
+	repo.notifications[n.ID] = n
+	return n
+}
+
+// ongoingPublic is published challenge "c1", ending a day after readNow.
+func ongoingPublic() challengerclient.Challenge {
+	return challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusPublish, EndsAt: readNow.Add(24 * time.Hour)}
+}
+
+func markRead(t *testing.T, svc *Service, user, id bson.ObjectID, action ReadAction) MarkReadResult {
+	t.Helper()
+	res, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: user, ID: id, Action: action})
+	if err != nil {
+		t.Fatalf("MarkRead: %v", err)
+	}
+	return res
+}
+
+func TestMarkRead_JumpInOngoingChallenge(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1", ButtonJumpIn, ButtonNah)
+	ch.challenges["c1"] = ongoingPublic()
+
+	res := markRead(t, svc, user, card.ID, ReadActionJumpIn)
+
+	if res.Navigate != (Navigate{Type: NavigateChallengeDetail, ChallengeID: "c1"}) || !res.Available {
+		t.Errorf("navigate = %+v available = %v", res.Navigate, res.Available)
+	}
+	row := repo.notifications[card.ID]
+	if row.ReadAt == nil || !row.ReadAt.Equal(readNow) || row.ReadAction != ReadActionJumpIn {
+		t.Errorf("read_at / read_action = %v / %q", row.ReadAt, row.ReadAction)
+	}
+	if row.ButtonsHiddenAt == nil || !row.ButtonsHiddenAt.Equal(readNow) {
+		t.Errorf("buttons_hidden_at = %v, want %v", row.ButtonsHiddenAt, readNow)
+	}
+	if !row.UpdatedAt.Equal(readNow) || row.UpdatedBy == nil || *row.UpdatedBy != userActor(user) {
+		t.Errorf("updated_at / updated_by = %v / %+v", row.UpdatedAt, row.UpdatedBy)
+	}
+	if res.Notification.ReadAt == nil || res.Notification.ButtonsHiddenAt == nil {
+		t.Errorf("result row not updated: %+v", res.Notification)
+	}
+
+	entries := repo.audit.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Entity != AuditEntityNotification || e.EntityID != card.ID.Hex() || e.Action != AuditActionUpdate || e.Actor != userActor(user) || e.UserID == nil || *e.UserID != user {
+		t.Errorf("entry = %+v", e)
+	}
+	want := map[string]FieldChange{
+		"read_at":           {To: readNow},
+		"read_action":       {To: ReadActionJumpIn},
+		"buttons_hidden_at": {To: readNow},
+	}
+	if !reflect.DeepEqual(e.Changes, want) {
+		t.Errorf("changes = %+v, want %+v", e.Changes, want)
+	}
+}
+
+func TestMarkRead_RetapEndedChallengeWritesNothing(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1", ButtonJumpIn)
+	earlier := readNow.Add(-time.Hour)
+	card.ReadAt, card.ReadAction, card.ButtonsHiddenAt = &earlier, ReadActionTap, &earlier
+	repo.notifications[card.ID] = card
+	ch.challenges["c1"] = challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusPublish, EndsAt: readNow}
+
+	res := markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if res.Navigate != (Navigate{Type: NavigateLeaderboard, ChallengeID: "c1"}) || !res.Available {
+		t.Errorf("navigate = %+v available = %v, want leaderboard", res.Navigate, res.Available)
+	}
+	if row := repo.notifications[card.ID]; !row.UpdatedAt.Equal(card.UpdatedAt) || !row.ReadAt.Equal(earlier) {
+		t.Errorf("row changed on a re-tap: %+v", row)
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0", n)
+	}
+}
+
+func TestMarkRead_UnavailableChallengeStillMarksRead(t *testing.T) {
+	cases := map[string]func(ch *mockChallenges){
+		"deleted": func(ch *mockChallenges) {
+			ch.challenges["c1"] = challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusPublish, Deleted: true}
+		},
+		"never existed": func(*mockChallenges) {},
+		"private, access lost": func(ch *mockChallenges) {
+			ch.challenges["c1"] = challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusPrivate, EndsAt: readNow.Add(time.Hour)}
+			ch.access["c1"] = challengerclient.Access{Reason: challengerclient.AccessDeniedNotWhitelisted}
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc, repo, ch := newReadSvc(readNow)
+			user := bson.NewObjectID()
+			card := seedCard(t, repo, user, "c1", ButtonJumpIn)
+			setup(ch)
+
+			res := markRead(t, svc, user, card.ID, ReadActionJumpIn)
+
+			if res.Navigate != (Navigate{Type: NavigateNone}) || res.Available {
+				t.Errorf("navigate = %+v available = %v, want none / false", res.Navigate, res.Available)
+			}
+			if repo.notifications[card.ID].ReadAt == nil {
+				t.Error("row not marked read")
+			}
+			if n := len(repo.audit.snapshot()); n != 1 {
+				t.Errorf("audit entries = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestMarkRead_PrivateChallengeUsesLiveAccess(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	// The cached ends_at says ongoing; the live access check says ended and wins.
+	ch.challenges["c1"] = challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusPrivate, EndsAt: readNow.Add(time.Hour)}
+	ch.access["c1"] = challengerclient.Access{Available: true, Ended: true}
+
+	res := markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if res.Navigate != (Navigate{Type: NavigateLeaderboard, ChallengeID: "c1"}) || !res.Available {
+		t.Errorf("navigate = %+v available = %v", res.Navigate, res.Available)
+	}
+	if want := []string{"c1/" + user.Hex()}; !reflect.DeepEqual(ch.accessCalls, want) {
+		t.Errorf("access calls = %v, want %v", ch.accessCalls, want)
+	}
+}
+
+func TestMarkRead_UnknownStatusChecksAccess(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	ch.challenges["c1"] = challengerclient.Challenge{ID: "c1", Status: challengerclient.ChallengeStatusUnknown}
+	ch.access["c1"] = challengerclient.Access{Available: true}
+
+	res := markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if len(ch.accessCalls) != 1 || res.Navigate.Type != NavigateChallengeDetail {
+		t.Errorf("access calls = %v, navigate = %+v", ch.accessCalls, res.Navigate)
+	}
+}
+
+func TestMarkRead_PublicChallengeSkipsAccessCheck(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	ch.challenges["c1"] = ongoingPublic()
+
+	markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if ch.getCalls != 1 || len(ch.accessCalls) != 0 {
+		t.Errorf("get / access calls = %d / %v, want 1 / none", ch.getCalls, ch.accessCalls)
+	}
+}
+
+func TestMarkRead_NoChallengeSkipsChallenger(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "")
+	card.Navigate = Navigate{Type: NavigateNone}
+	repo.notifications[card.ID] = card
+
+	res := markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if res.Navigate != (Navigate{Type: NavigateNone}) || !res.Available || ch.getCalls != 0 {
+		t.Errorf("navigate = %+v available = %v get calls = %d", res.Navigate, res.Available, ch.getCalls)
+	}
+}
+
+func TestMarkRead_NahHidesButtons(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1", ButtonJumpIn, ButtonNah)
+	ch.challenges["c1"] = ongoingPublic()
+
+	markRead(t, svc, user, card.ID, ReadActionNah)
+
+	if row := repo.notifications[card.ID]; row.ReadAction != ReadActionNah || row.ButtonsHiddenAt == nil {
+		t.Errorf("read_action = %q buttons_hidden_at = %v", row.ReadAction, row.ButtonsHiddenAt)
+	}
+}
+
+func TestMarkRead_AfterReadAllHidesButtonsOnly(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1", ButtonJumpIn)
+	earlier := readNow.Add(-time.Hour)
+	card.ReadAt, card.ReadAction = &earlier, ReadActionReadAll
+	repo.notifications[card.ID] = card
+	ch.challenges["c1"] = ongoingPublic()
+
+	markRead(t, svc, user, card.ID, ReadActionJumpIn)
+
+	row := repo.notifications[card.ID]
+	if row.ReadAction != ReadActionReadAll || !row.ReadAt.Equal(earlier) || row.ButtonsHiddenAt == nil {
+		t.Errorf("row = read_at %v action %q hidden %v; first read must be kept", row.ReadAt, row.ReadAction, row.ButtonsHiddenAt)
+	}
+	entries := repo.audit.snapshot()
+	if want := map[string]FieldChange{"buttons_hidden_at": {To: readNow}}; len(entries) != 1 || !reflect.DeepEqual(entries[0].Changes, want) {
+		t.Errorf("entries = %+v, want one with %+v", entries, want)
+	}
+}
+
+func TestMarkRead_RowWithoutButtons(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	ch.challenges["c1"] = ongoingPublic()
+
+	markRead(t, svc, user, card.ID, ReadActionTap)
+
+	if repo.notifications[card.ID].ButtonsHiddenAt != nil {
+		t.Error("buttons_hidden_at set on a row without buttons")
+	}
+	if entries := repo.audit.snapshot(); len(entries) != 1 || len(entries[0].Changes) != 2 {
+		t.Errorf("entries = %+v, want read_at + read_action only", entries)
+	}
+}
+
+func TestMarkRead_ForeignOrUnknownIDIsNotFound(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	owner := bson.NewObjectID()
+	card := seedCard(t, repo, owner, "c1", ButtonJumpIn)
+	ch.challenges["c1"] = ongoingPublic()
+
+	for name, id := range map[string]bson.ObjectID{"another user's": card.ID, "unknown": bson.NewObjectID()} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: bson.NewObjectID(), ID: id, Action: ReadActionTap})
+			if !errors.Is(err, ErrNotFound) {
+				t.Errorf("err = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	if repo.notifications[card.ID].ReadAt != nil || len(repo.audit.snapshot()) != 0 || ch.getCalls != 0 {
+		t.Errorf("foreign read changed state: row %+v, entries %d, challenger calls %d", repo.notifications[card.ID], len(repo.audit.snapshot()), ch.getCalls)
+	}
+}
+
+func TestMarkRead_ChallengerUnavailable(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	ch.err = fmt.Errorf("%w: grpc Unavailable", challengerclient.ErrUnavailable)
+
+	_, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: user, ID: card.ID, Action: ReadActionTap})
+	if !errors.Is(err, ErrChallengerUnavailable) {
+		t.Fatalf("err = %v, want ErrChallengerUnavailable", err)
+	}
+	// The read itself is recorded; a retry resolves navigate without a second entry.
+	if repo.notifications[card.ID].ReadAt == nil || len(repo.audit.snapshot()) != 1 {
+		t.Errorf("row / entries after a challenger outage = %+v / %d", repo.notifications[card.ID], len(repo.audit.snapshot()))
+	}
+}
+
+func TestMarkRead_ChallengerConfigErrorIsNotUnavailable(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	ch.err = challengerclient.ErrUnauthenticated
+
+	_, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: user, ID: card.ID, Action: ReadActionTap})
+	if err == nil || errors.Is(err, ErrChallengerUnavailable) {
+		t.Errorf("err = %v, want a plain (500) error", err)
+	}
+}
+
+func TestMarkRead_AuditFailureRollsBack(t *testing.T) {
+	svc, repo, ch := newReadSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1", ButtonJumpIn)
+	ch.challenges["c1"] = ongoingPublic()
+	repo.audit.err = errors.New("audit down")
+
+	if _, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: user, ID: card.ID, Action: ReadActionJumpIn}); !errors.Is(err, repo.audit.err) {
+		t.Fatalf("err = %v, want the audit error", err)
+	}
+	if row := repo.notifications[card.ID]; row.ReadAt != nil || row.ButtonsHiddenAt != nil {
+		t.Errorf("row changed although the audit failed: %+v", row)
+	}
+	if ch.getCalls != 0 {
+		t.Errorf("challenger called %d times after a failed write", ch.getCalls)
+	}
+}
+
+func TestMarkRead_RepoErrorPropagates(t *testing.T) {
+	for _, method := range []string{"FindNotification", "UpdateRead"} {
+		t.Run(method, func(t *testing.T) {
+			svc, repo, _ := newReadSvc(readNow)
+			user := bson.NewObjectID()
+			card := seedCard(t, repo, user, "c1")
+			boom := errors.New("mongo down")
+			repo.failOn = map[string]error{method: boom}
+
+			if _, err := svc.MarkRead(context.Background(), MarkReadInput{UserID: user, ID: card.ID, Action: ReadActionTap}); !errors.Is(err, boom) {
+				t.Errorf("err = %v, want %v", err, boom)
+			}
+		})
+	}
+}
+
+func TestMarkAllRead_MarksUnreadKeepsButtons(t *testing.T) {
+	svc, repo := newSvc(readNow)
+	user, other := bson.NewObjectID(), bson.NewObjectID()
+	for i := range 7 {
+		if i%2 == 0 {
+			seedCard(t, repo, user, "c1", ButtonJumpIn)
+		} else {
+			seedCard(t, repo, user, "c1")
+		}
+	}
+	earlier := readNow.Add(-time.Hour)
+	for range 2 {
+		read := seedCard(t, repo, user, "c1")
+		read.ReadAt, read.ReadAction = &earlier, ReadActionTap
+		repo.notifications[read.ID] = read
+	}
+	for range 3 {
+		seedCard(t, repo, other, "c1")
+	}
+
+	updated, err := svc.MarkAllRead(context.Background(), MarkAllReadInput{UserID: user})
+	if err != nil || updated != 7 {
+		t.Fatalf("MarkAllRead = %d, %v; want 7, nil", updated, err)
+	}
+	for _, row := range repo.notifications {
+		switch {
+		case row.UserID == other && row.ReadAt != nil:
+			t.Errorf("other user's row read: %+v", row)
+		case row.UserID == user && row.ReadAt == nil:
+			t.Errorf("row left unread: %+v", row)
+		case row.UserID == user && row.ButtonsHiddenAt != nil:
+			t.Errorf("read-all hid buttons: %+v", row)
+		case row.UserID == user && row.ReadAt.Equal(readNow) && row.ReadAction != ReadActionReadAll:
+			t.Errorf("read_action = %q, want read_all", row.ReadAction)
+		}
+	}
+	entries := repo.audit.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Entity != AuditEntityNotification || e.EntityID != "" || e.Action != AuditActionUpdate || e.Count != 7 || e.UserID == nil || *e.UserID != user || e.Actor != userActor(user) {
+		t.Errorf("entry = %+v", e)
+	}
+}
+
+func TestMarkAllRead_NothingUnreadWritesNoEntry(t *testing.T) {
+	svc, repo := newSvc(readNow)
+	updated, err := svc.MarkAllRead(context.Background(), MarkAllReadInput{UserID: bson.NewObjectID()})
+	if err != nil || updated != 0 {
+		t.Fatalf("MarkAllRead = %d, %v; want 0, nil", updated, err)
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0", n)
+	}
+}
+
+func TestMarkAllRead_AuditFailureRollsBack(t *testing.T) {
+	svc, repo := newSvc(readNow)
+	user := bson.NewObjectID()
+	card := seedCard(t, repo, user, "c1")
+	repo.audit.err = errors.New("audit down")
+
+	if _, err := svc.MarkAllRead(context.Background(), MarkAllReadInput{UserID: user}); !errors.Is(err, repo.audit.err) {
+		t.Fatalf("err = %v, want the audit error", err)
+	}
+	if repo.notifications[card.ID].ReadAt != nil {
+		t.Error("row read although the audit failed")
+	}
+}
+
+func TestMarkAllRead_RepoErrorPropagates(t *testing.T) {
+	svc, repo := newSvc(readNow)
+	boom := errors.New("mongo down")
+	repo.failOn = map[string]error{"MarkAllRead": boom}
+	if _, err := svc.MarkAllRead(context.Background(), MarkAllReadInput{UserID: bson.NewObjectID()}); !errors.Is(err, boom) {
+		t.Errorf("err = %v, want %v", err, boom)
+	}
+}
+
+func TestBuildReadUpdate(t *testing.T) {
+	actor := userActor(bson.NewObjectID())
+	earlier := readNow.Add(-time.Hour)
+	cases := []struct {
+		name        string
+		row         Notification
+		wantChanged []string
+	}{
+		{"unread with buttons", Notification{Buttons: []Button{ButtonJumpIn}}, []string{"buttons_hidden_at", "read_action", "read_at"}},
+		{"unread without buttons", Notification{}, []string{"read_action", "read_at"}},
+		{"read, buttons shown", Notification{ReadAt: &earlier, Buttons: []Button{ButtonNah}}, []string{"buttons_hidden_at"}},
+		{"read, buttons hidden", Notification{ReadAt: &earlier, Buttons: []Button{ButtonNah}, ButtonsHiddenAt: &earlier}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u, changes := buildReadUpdate(tc.row, ReadActionTap, actor, readNow)
+			var got []string
+			for k := range changes {
+				got = append(got, k)
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, tc.wantChanged) {
+				t.Errorf("changed = %v, want %v", got, tc.wantChanged)
+			}
+			if (u.ReadAt != nil) != (changes["read_at"] != FieldChange{}) || (u.ButtonsHiddenAt != nil) != (changes["buttons_hidden_at"] != FieldChange{}) {
+				t.Errorf("update %+v disagrees with changes %+v", u, changes)
+			}
+			if !u.UpdatedAt.Equal(readNow) || u.UpdatedBy != actor {
+				t.Errorf("updated_* = %v / %+v", u.UpdatedAt, u.UpdatedBy)
+			}
+		})
 	}
 }

@@ -73,3 +73,30 @@ The service tests run against `mockRepo`: an in-memory device table that enforce
 | Service error → 500 without leaking | `TestPurgeUser_ServiceError` |
 | Secret unset → 404; missing / wrong secret → 401; right secret reaches the handler without Bearer | `router_test.go::TestNewRouter_InternalPurge_NotMountedWithoutSecret`, `TestNewRouter_InternalPurge_RequiresSecretNotBearer` |
 | Secret from env; empty by default; < 32 bytes fails boot | `config_test.go::TestLoad_Notification_InternalSecret`, `TestValidate_Guards` |
+
+## CHAL-400 — mark read / read-all
+
+| AC / requirement | Test |
+|---|---|
+| `jump_in` on an ongoing public challenge → `challenge_detail`, read, buttons hidden, `updated_by` user/api, one entry `{read_at, read_action, buttons_hidden_at}` | `service_test.go::TestMarkRead_JumpInOngoingChallenge` |
+| Ended challenge re-tap → `leaderboard`, row unchanged, no entry | `TestMarkRead_RetapEndedChallengeWritesNothing` |
+| Deleted / never existed / private without access → `none`, `available=false`, row still read, entry written | `TestMarkRead_UnavailableChallengeStillMarksRead` |
+| Private: live access decides, and its `ended` wins over the cached `ends_at` | `TestMarkRead_PrivateChallengeUsesLiveAccess` |
+| Unknown status is checked like private; public skips the access check; no challenge → no challenger call | `TestMarkRead_UnknownStatusChecksAccess`, `TestMarkRead_PublicChallengeSkipsAccessCheck`, `TestMarkRead_NoChallengeSkipsChallenger` |
+| `nah` hides buttons; a read-all row keeps its first `read_action` and only hides buttons; a row without buttons records 2 fields | `TestMarkRead_NahHidesButtons`, `TestMarkRead_AfterReadAllHidesButtonsOnly`, `TestMarkRead_RowWithoutButtons` |
+| Another user's / unknown id → `ErrNotFound`, nothing written, challenger not called | `TestMarkRead_ForeignOrUnknownIDIsNotFound` |
+| Challenger outage → `ErrChallengerUnavailable`, read kept; a config error is not an outage | `TestMarkRead_ChallengerUnavailable`, `TestMarkRead_ChallengerConfigErrorIsNotUnavailable` |
+| Audit failure → row unchanged, challenger not called; repo errors propagate | `TestMarkRead_AuditFailureRollsBack`, `TestMarkRead_RepoErrorPropagates` |
+| Read-all: 7 unread → 7, buttons kept, other users untouched, one entry `count = 7` / `entity_id = ""`; 0 → no entry; rollback; repo error | `TestMarkAllRead_MarksUnreadKeepsButtons`, `TestMarkAllRead_NothingUnreadWritesNoEntry`, `TestMarkAllRead_AuditFailureRollsBack`, `TestMarkAllRead_RepoErrorPropagates` |
+| What a read changes, per row state | `TestBuildReadUpdate` |
+| `$set` doc and read-all filter | `repository_mongo_test.go::TestBuildReadSet`, `TestBuildMarkAllReadFilter` |
+| Response mapping (`buttons: []`, navigate, available, `Cache-Control`); none navigate omits `challenge_id` | `handler_test.go::TestMarkRead_MapsResponse`, `TestMarkRead_UnavailableNavigate` |
+| `read_all` / unknown / missing action, no body, malformed id → 400 | `TestMarkRead_InvalidRequest` |
+| 404 / 503 + `Retry-After` / 401 | `TestMarkRead_NotFound`, `TestMarkRead_ChallengerUnavailableIs503`, `TestMarkRead_NoUser` |
+| Read-all with no body or `{}` → `{updated}`; 401 / 500 | `TestMarkAllRead_ReportsUpdated`, `TestMarkAllRead_NoUserAndServiceError` |
+| Client: mapping + metadata + per-attempt deadline; unset times / unknown enums | `internal/infra/challengerclient/client_test.go::TestGetChallenge_MapsAndSendsMetadata`, `TestGetChallenge_UnsetTimesAndUnknownStatus`, `TestCheckChallengeAccess_MapsReasons` |
+| Client: 5-min cache, errors not cached, bounded | `TestGetChallenge_CachedForTTL`, `TestGetChallenge_ErrorsAreNotCached`, `TestChallengeCache_BoundedSize` |
+| Client: retry on UNAVAILABLE / DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED, give up after 3, no retry on NOT_FOUND / INVALID_ARGUMENT / UNAUTHENTICATED / INTERNAL, caller cancel stops | `TestInvoke_RetriesTransientCodes`, `TestInvoke_GivesUpAfterMaxAttempts`, `TestInvoke_DoesNotRetryPermanentErrors`, `TestInvoke_CallerCancelStopsRetrying` |
+| Client: Addr / Secret required; lazy default dial; Close twice | `TestNew_RequiresAddrAndSecret`, `TestNew_DefaultDialIsLazy` |
+| Config: `SVC_CHALLENGER_GRPC_*` defaults, overrides, required / bounds | `config_test.go::TestLoad_Challenger`, `TestValidate_Guards` |
+

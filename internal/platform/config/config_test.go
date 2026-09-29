@@ -38,6 +38,8 @@ func validBaseEnv() map[string]string {
 		"SVC_VALKEY_ADDR":             "localhost:6379",
 		"SVC_AUTH_JWT_ACCESS_SECRET":  "access",
 		"SVC_AUTH_JWT_REFRESH_SECRET": "refresh",
+		"SVC_CHALLENGER_GRPC_ADDR":    "dns:///challenger-internal-grpc:7992",
+		"SVC_CHALLENGER_GRPC_SECRET":  "grpc-secret",
 	}
 }
 
@@ -198,6 +200,10 @@ func TestValidate_Guards(t *testing.T) {
 		{"jwt access secret required", map[string]string{"SVC_AUTH_JWT_ACCESS_SECRET": ""}, "SVC_AUTH_JWT_ACCESS_SECRET"},
 		{"jwt refresh secret required", map[string]string{"SVC_AUTH_JWT_REFRESH_SECRET": ""}, "SVC_AUTH_JWT_REFRESH_SECRET"},
 		{"internal secret too short", map[string]string{"SVC_NOTIFICATION_INTERNAL_API_SECRET": "short"}, "SVC_NOTIFICATION_INTERNAL_API_SECRET"},
+		{"challenger addr required", map[string]string{"SVC_CHALLENGER_GRPC_ADDR": ""}, "SVC_CHALLENGER_GRPC_ADDR"},
+		{"challenger secret required", map[string]string{"SVC_CHALLENGER_GRPC_SECRET": ""}, "SVC_CHALLENGER_GRPC_SECRET"},
+		{"challenger call timeout positive", map[string]string{"SVC_CHALLENGER_GRPC_CALL_TIMEOUT": "0s"}, "SVC_CHALLENGER_GRPC_CALL_TIMEOUT"},
+		{"challenger attempts >= 1", map[string]string{"SVC_CHALLENGER_GRPC_MAX_ATTEMPTS": "0"}, "SVC_CHALLENGER_GRPC_MAX_ATTEMPTS"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -305,5 +311,28 @@ func TestLoad_Notification_InternalSecret(t *testing.T) {
 	}
 	if cfg.Notification.InternalAPISecret != env["SVC_NOTIFICATION_INTERNAL_API_SECRET"] {
 		t.Errorf("secret = %q, want the env value", cfg.Notification.InternalAPISecret)
+	}
+}
+
+func TestLoad_Challenger(t *testing.T) {
+	env := validBaseEnv()
+	setEnv(t, env)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	want := ChallengerConfig{GRPCAddr: env["SVC_CHALLENGER_GRPC_ADDR"], GRPCSecret: env["SVC_CHALLENGER_GRPC_SECRET"], GRPCCallTimeout: 2 * time.Second, GRPCMaxAttempts: 3}
+	if cfg.Challenger != want {
+		t.Errorf("challenger = %+v, want %+v", cfg.Challenger, want)
+	}
+
+	env["SVC_CHALLENGER_GRPC_CALL_TIMEOUT"] = "500ms"
+	env["SVC_CHALLENGER_GRPC_MAX_ATTEMPTS"] = "5"
+	setEnv(t, env)
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if cfg.Challenger.GRPCCallTimeout != 500*time.Millisecond || cfg.Challenger.GRPCMaxAttempts != 5 {
+		t.Errorf("overrides = %+v", cfg.Challenger)
 	}
 }

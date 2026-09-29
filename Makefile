@@ -1,4 +1,4 @@
-.PHONY: run build test test-integration coverage lint fmt docker-build compose-up compose-up-kafka compose-up-signoz compose-down-signoz compose-down compose-logs tidy version hooks smoke help
+.PHONY: run build test test-integration coverage lint fmt proto-mirror-check docker-build compose-up compose-up-kafka compose-up-signoz compose-down-signoz compose-down compose-logs tidy version hooks smoke help
 GO          ?= go
 APP         := go-service-template
 DOCKER_IMG  ?= go-service-template
@@ -81,6 +81,16 @@ coverage-gate:     ## Per-file coverage gate (>=85%) skipping bootstrap/integrat
 	  | grep -v '/internal/infra/mongox/index\.go:' \
 	  | grep -v '\.pb\.go:' \
 	  | awk 'NR==1 || /^total:/ {next} {sub(":.*","",$$1); pct=$$3; gsub("%","",pct); sum[$$1]+=pct; n[$$1]++} END {fail=0; for (f in n) {avg=sum[f]/n[f]; if (avg<85.0) {printf "FAIL %.1f%% %s\n", avg, f; fail=1}} if (fail) exit 1; print "coverage-gate ok: every non-bootstrap file >=85%"}'
+# proto-mirror-check diffs proto/challenger/internalv1 against challenger-service at the commit in
+# proto/challenger/VERSION (design §6). The mirror is byte-for-byte, generated code included.
+CHALLENGER_SERVICE_DIR ?= ../challenger-service
+proto-mirror-check: ## Diff the challenger.internal.v1 mirror against challenger-service (CHALLENGER_SERVICE_DIR, default ../challenger-service)
+	@rev=$$(cat proto/challenger/VERSION); fail=0; \
+	for f in proto/challenger/internalv1/*; do \
+	  git -C $(CHALLENGER_SERVICE_DIR) show "$$rev:$$f" | cmp -s - "$$f" || { echo "DRIFT $$f (vs challenger-service $$rev)"; fail=1; }; \
+	done; \
+	[ "$$fail" -eq 0 ] && echo "proto mirror matches challenger-service $$rev" || exit 1
+
 smoke:             ; ./scripts/smoke.sh                                    ## Boot throwaway mongo+valkey, run integration gate, start the binary, probe HTTP + graceful shutdown
 lint:              ; golangci-lint run                                     ## Run golangci-lint
 fmt:               ; gofmt -s -w . && goimports -w -local github.com/Everfit-io/go-service-template .  ## Run gofmt + goimports

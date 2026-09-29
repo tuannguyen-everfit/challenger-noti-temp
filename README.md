@@ -101,6 +101,8 @@ All variables use the `SVC_` prefix. For local development copy
 | `SVC_AUTH_JWT_ACCESS_SECRET` / `SVC_AUTH_JWT_REFRESH_SECRET` | — | yes — boot fails without both (every public route is Bearer-authed) |
 | `SVC_PAGINATION_MAX_LIMIT` | `100` | no |
 | `SVC_NOTIFICATION_INTERNAL_API_SECRET` | (empty) | no — empty leaves the account-deletion purge route unmounted; when set, ≥ 32 bytes |
+| `SVC_CHALLENGER_GRPC_ADDR` / `SVC_CHALLENGER_GRPC_SECRET` | — | yes — challenger's internal gRPC (`dns:///challenger-internal-grpc.<ns>.svc.cluster.local:7992`); the secret = challenger's `CHALLENGER_GRPC_INTERNAL_SECRET` |
+| `SVC_CHALLENGER_GRPC_CALL_TIMEOUT` / `SVC_CHALLENGER_GRPC_MAX_ATTEMPTS` | `2s` / `3` | no — per attempt; retries on `UNAVAILABLE` / `DEADLINE_EXCEEDED` / `RESOURCE_EXHAUSTED` |
 
 `MONGO_URI` must contain `replicaSet=` — enforced at startup to guarantee dev/prod parity for transactions.
 

@@ -1,4 +1,5 @@
-// Package notification serves the in-app notification feed, unread summary, push-device registry and account-deletion purge.
+// Package notification serves the in-app notification feed, unread summary, mark-read,
+// push-device registry and account-deletion purge.
 package notification
 
 import (
@@ -7,12 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Everfit-io/go-service-template/internal/infra/challengerclient"
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
 	"github.com/Everfit-io/go-service-template/internal/platform/localization"
@@ -119,8 +122,9 @@ type AuditEntity string
 
 // AuditEntity values.
 const (
-	AuditEntityDevice AuditEntity = "device"
-	AuditEntityUser   AuditEntity = "user" // account-deletion purge
+	AuditEntityNotification AuditEntity = "notification"
+	AuditEntityDevice       AuditEntity = "device"
+	AuditEntityUser         AuditEntity = "user" // account-deletion purge
 )
 
 // AuditAction is what happened to the record.
@@ -150,7 +154,8 @@ const (
 
 // auditFields is the per-entity allow-list for AuditLog.Changes; anything else is dropped.
 var auditFields = map[AuditEntity]map[string]auditFieldMode{
-	AuditEntityDevice: {"platform": auditFieldValue, "app_version": auditFieldValue, "token": auditFieldMasked},
+	AuditEntityNotification: {"read_at": auditFieldValue, "read_action": auditFieldValue, "buttons_hidden_at": auditFieldValue},
+	AuditEntityDevice:       {"platform": auditFieldValue, "app_version": auditFieldValue, "token": auditFieldMasked},
 }
 
 // summaryCountCap bounds every summary count: clients render ≥ 100 as "99+".
@@ -181,6 +186,12 @@ type Repo interface {
 	TouchDevice(ctx context.Context, id bson.ObjectID, at time.Time) error
 	// DeleteDevice removes the row; false when it was already gone.
 	DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, error)
+	// FindNotification returns the user's row; false for an unknown id or another user's row.
+	FindNotification(ctx context.Context, userID, id bson.ObjectID) (Notification, bool, error)
+	// UpdateRead writes the non-nil fields of u plus updated_at / updated_by.
+	UpdateRead(ctx context.Context, id bson.ObjectID, u readUpdate) error
+	// MarkAllRead sets read_at / read_action = read_all on every unread row of the user; buttons stay.
+	MarkAllRead(ctx context.Context, userID bson.ObjectID, at time.Time, by Actor) (int64, error)
 	// DeleteNotificationsByUser hard-deletes every notification of the user and returns the count.
 	DeleteNotificationsByUser(ctx context.Context, userID bson.ObjectID) (int64, error)
 	// DeleteDevicesByUser hard-deletes every device of the user and returns the count.
@@ -193,22 +204,29 @@ type AuditWriter interface {
 	Write(ctx context.Context, e AuditLog) error
 }
 
+// challengeClient is the subset of challengerclient.Client that MarkRead depends on.
+type challengeClient interface {
+	GetChallenge(ctx context.Context, id string) (challengerclient.Challenge, error)
+	CheckChallengeAccess(ctx context.Context, challengeID, userID string) (challengerclient.Access, error)
+}
+
 // Config holds the feature's operational knobs, mapped from platform config in app.go.
 type Config struct {
 	MaxListLimit int
 }
 
-// Service owns the feed, summary and device paths.
+// Service owns the feed, summary, read, device and purge paths.
 type Service struct {
-	repo  Repo
-	audit AuditWriter
-	cfg   Config
-	now   func() time.Time
+	repo       Repo
+	audit      AuditWriter
+	challenges challengeClient
+	cfg        Config
+	now        func() time.Time
 }
 
 // New builds the Service.
-func New(repo Repo, audit AuditWriter, cfg Config) *Service {
-	return &Service{repo: repo, audit: audit, cfg: cfg, now: timex.Now}
+func New(repo Repo, audit AuditWriter, challenges challengeClient, cfg Config) *Service {
+	return &Service{repo: repo, audit: audit, challenges: challenges, cfg: cfg, now: timex.Now}
 }
 
 // Notification is one card in a user's feed.
@@ -343,6 +361,34 @@ type RegisterDeviceInput struct {
 type RemoveDeviceInput struct {
 	UserID   bson.ObjectID
 	DeviceID string
+}
+
+// MarkReadInput is the MarkRead request; Action is tap, jump_in or nah.
+type MarkReadInput struct {
+	UserID bson.ObjectID
+	ID     bson.ObjectID
+	Action ReadAction
+}
+
+// MarkReadResult is the row after the read and the destination resolved now.
+type MarkReadResult struct {
+	Notification Notification
+	Navigate     Navigate
+	Available    bool // false: the challenge is gone or no longer visible to the user
+}
+
+// MarkAllReadInput is the MarkAllRead request.
+type MarkAllReadInput struct {
+	UserID bson.ObjectID
+}
+
+// readUpdate is what one mark-read writes; nil pointers leave the field as it is.
+type readUpdate struct {
+	ReadAt          *time.Time
+	ReadAction      ReadAction
+	ButtonsHiddenAt *time.Time
+	UpdatedAt       time.Time
+	UpdatedBy       Actor
 }
 
 // PurgeUserInput is the PurgeUser request; Caller is the calling service (`everfit-source`).
@@ -488,6 +534,64 @@ func (s *Service) RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool,
 	return removed, nil
 }
 
+// MarkRead marks the caller's notification read (first read only) and hides its buttons, in one
+// transaction with the audit entry, then resolves where the tap goes now. A re-tap writes
+// nothing. The read is kept when challenger is unavailable; a retry resolves navigate.
+func (s *Service) MarkRead(ctx context.Context, in MarkReadInput) (MarkReadResult, error) {
+	now := s.now()
+	actor := buildUserActor(in.UserID)
+	var n Notification
+	err := s.runAudited(ctx, func(ctx context.Context) error {
+		cur, found, err := s.repo.FindNotification(ctx, in.UserID, in.ID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotFound
+		}
+		n = cur
+		u, changes := buildReadUpdate(cur, in.Action, actor, now)
+		if len(changes) == 0 {
+			return nil
+		}
+		if err := s.repo.UpdateRead(ctx, cur.ID, u); err != nil {
+			return err
+		}
+		n = applyReadUpdate(cur, u)
+		return s.recordAudit(ctx, buildNotificationAudit(cur, actor, changes, now))
+	})
+	if err != nil {
+		return MarkReadResult{}, fmt.Errorf("mark read: %w", err)
+	}
+	nav, available, err := s.resolveNavigate(ctx, in.UserID, n.Navigate)
+	if err != nil {
+		return MarkReadResult{}, fmt.Errorf("mark read: %w", err)
+	}
+	return MarkReadResult{Notification: n, Navigate: nav, Available: available}, nil
+}
+
+// MarkAllRead marks every unread notification of the caller read with one audit entry; buttons stay.
+func (s *Service) MarkAllRead(ctx context.Context, in MarkAllReadInput) (int64, error) {
+	now := s.now()
+	actor := buildUserActor(in.UserID)
+	var updated int64
+	err := s.runAudited(ctx, func(ctx context.Context) error {
+		var err error
+		if updated, err = s.repo.MarkAllRead(ctx, in.UserID, now, actor); err != nil {
+			return err
+		}
+		owner := in.UserID
+		return s.recordAudit(ctx, AuditLog{
+			Entity: AuditEntityNotification, UserID: &owner, Action: AuditActionUpdate,
+			Actor: actor, Count: int(updated), At: now,
+		})
+	})
+	if err != nil {
+		return 0, fmt.Errorf("mark all read: %w", err)
+	}
+	return updated, nil
+}
+
 // PurgeUser hard-deletes the user's notifications and devices with one `purge` entry, in one
 // transaction. Idempotent: a repeat deletes nothing and writes no entry. Audit entries are kept.
 func (s *Service) PurgeUser(ctx context.Context, in PurgeUserInput) (PurgeUserResult, error) {
@@ -507,6 +611,51 @@ func (s *Service) PurgeUser(ctx context.Context, in PurgeUserInput) (PurgeUserRe
 		return PurgeUserResult{}, fmt.Errorf("purge user: %w", err)
 	}
 	return out, nil
+}
+
+// resolveNavigate re-checks the stored destination against challenger now: gone, deleted or no
+// longer visible → none / unavailable; ended → leaderboard; otherwise challenge detail.
+func (s *Service) resolveNavigate(ctx context.Context, userID bson.ObjectID, stored Navigate) (Navigate, bool, error) {
+	if stored.Type == NavigateNone || stored.ChallengeID == "" {
+		return Navigate{Type: NavigateNone}, true, nil
+	}
+	unavailable := Navigate{Type: NavigateNone}
+	ch, err := s.challenges.GetChallenge(ctx, stored.ChallengeID)
+	if errors.Is(err, challengerclient.ErrNotFound) {
+		return unavailable, false, nil
+	}
+	if err != nil {
+		return Navigate{}, false, s.translateChallengerErr(ctx, stored.ChallengeID, err)
+	}
+	if ch.Deleted {
+		return unavailable, false, nil
+	}
+	ended := !ch.EndsAt.IsZero() && !s.now().Before(ch.EndsAt)
+	// Only a published challenge is open to everyone; private (or a status this build doesn't know) needs the live check.
+	if ch.Status != challengerclient.ChallengeStatusPublish {
+		access, err := s.challenges.CheckChallengeAccess(ctx, stored.ChallengeID, userID.Hex())
+		if err != nil {
+			return Navigate{}, false, s.translateChallengerErr(ctx, stored.ChallengeID, err)
+		}
+		if !access.Available {
+			return unavailable, false, nil
+		}
+		ended = access.Ended
+	}
+	if ended {
+		return Navigate{Type: NavigateLeaderboard, ChallengeID: stored.ChallengeID}, true, nil
+	}
+	return Navigate{Type: NavigateChallengeDetail, ChallengeID: stored.ChallengeID}, true, nil
+}
+
+// translateChallengerErr turns an outage into ErrChallengerUnavailable (503); anything else is
+// our bug or config (secret drift) and stays a 500.
+func (s *Service) translateChallengerErr(ctx context.Context, challengeID string, err error) error {
+	if errors.Is(err, challengerclient.ErrUnavailable) {
+		log(ctx).Warn("challenger unavailable; navigate not resolved", slog.String("challenge_id", challengeID), slog.String("error", err.Error()))
+		return fmt.Errorf("%w: %w", ErrChallengerUnavailable, err)
+	}
+	return fmt.Errorf("resolve navigate %s: %w", challengeID, err)
 }
 
 func (s *Service) registerDevice(ctx context.Context, in RegisterDeviceInput, now time.Time) (Device, error) {
@@ -670,6 +819,48 @@ func parseTimezone(name string) (*time.Location, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidTimezone, err)
 	}
 	return loc, nil
+}
+
+// buildReadUpdate lists what a read changes on n: read_at + read_action on the first read only,
+// buttons_hidden_at when buttons are still shown. No changes means nothing to write.
+func buildReadUpdate(n Notification, action ReadAction, actor Actor, now time.Time) (readUpdate, map[string]FieldChange) {
+	u := readUpdate{UpdatedAt: now, UpdatedBy: actor}
+	changes := map[string]FieldChange{}
+	if n.ReadAt == nil {
+		u.ReadAt, u.ReadAction = &now, action
+		changes["read_at"] = FieldChange{To: now}
+		changes["read_action"] = FieldChange{To: action}
+	}
+	if len(n.Buttons) > 0 && n.ButtonsHiddenAt == nil {
+		u.ButtonsHiddenAt = &now
+		changes["buttons_hidden_at"] = FieldChange{To: now}
+	}
+	return u, changes
+}
+
+func applyReadUpdate(n Notification, u readUpdate) Notification {
+	if u.ReadAt != nil {
+		n.ReadAt, n.ReadAction = u.ReadAt, u.ReadAction
+	}
+	if u.ButtonsHiddenAt != nil {
+		n.ButtonsHiddenAt = u.ButtonsHiddenAt
+	}
+	by := u.UpdatedBy
+	n.UpdatedAt, n.UpdatedBy = u.UpdatedAt, &by
+	return n
+}
+
+func buildNotificationAudit(n Notification, actor Actor, changes map[string]FieldChange, at time.Time) AuditLog {
+	owner := n.UserID
+	return AuditLog{
+		Entity:   AuditEntityNotification,
+		EntityID: n.ID.Hex(),
+		UserID:   &owner,
+		Action:   AuditActionUpdate,
+		Actor:    actor,
+		Changes:  changes,
+		At:       at,
+	}
 }
 
 func buildUserActor(userID bson.ObjectID) Actor {

@@ -33,6 +33,7 @@ type Config struct {
 	Auth            AuthConfig         `mapstructure:"auth"`
 	Pagination      PaginationConfig   `mapstructure:"pagination"`
 	Notification    NotificationConfig `mapstructure:"notification"`
+	Challenger      ChallengerConfig   `mapstructure:"challenger"`
 	ShutdownTimeout time.Duration      `mapstructure:"shutdown_timeout"`
 }
 
@@ -64,6 +65,16 @@ type AuthConfig struct {
 // CHALLENGER_LEADERBOARD_INTERNAL_API_SECRET: one secret per route family.
 type NotificationConfig struct {
 	InternalAPISecret string `mapstructure:"internal_api_secret"` // SVC_NOTIFICATION_INTERNAL_API_SECRET; empty disables the route
+}
+
+// ChallengerConfig is the gRPC client to challenger-service's challenger.internal.v1 read API
+// (mark-read resolves navigate through GetChallenge + CheckChallengeAccess). Addr and Secret are
+// required: without them every read would 503.
+type ChallengerConfig struct {
+	GRPCAddr        string        `mapstructure:"grpc_addr"`         // SVC_CHALLENGER_GRPC_ADDR, e.g. dns:///challenger-internal-grpc.<ns>.svc.cluster.local:7992
+	GRPCSecret      string        `mapstructure:"grpc_secret"`       // SVC_CHALLENGER_GRPC_SECRET = challenger's CHALLENGER_GRPC_INTERNAL_SECRET
+	GRPCCallTimeout time.Duration `mapstructure:"grpc_call_timeout"` // SVC_CHALLENGER_GRPC_CALL_TIMEOUT, default 2s per attempt
+	GRPCMaxAttempts int           `mapstructure:"grpc_max_attempts"` // SVC_CHALLENGER_GRPC_MAX_ATTEMPTS, default 3
 }
 
 // minInternalSecretLen is the shortest accepted internal secret: it authorises a hard delete.
@@ -206,6 +217,8 @@ func Load() (*Config, error) {
 	v.SetDefault("shutdown_timeout", "15s")
 	v.SetDefault("auth.jwt_access_ttl", "1h")
 	v.SetDefault("auth.jwt_refresh_ttl", "720h")
+	v.SetDefault("challenger.grpc_call_timeout", "2s")
+	v.SetDefault("challenger.grpc_max_attempts", 3)
 	v.SetDefault("pagination.max_limit", 100) // shared `?limit=` ceiling for every list endpoint; per-feature Service rejects oversized with 400
 
 	// Explicit env binds for keys without defaults. viper.AutomaticEnv only
@@ -223,6 +236,8 @@ func Load() (*Config, error) {
 		{"auth.jwt_access_secret", "SVC_AUTH_JWT_ACCESS_SECRET"},
 		{"auth.jwt_refresh_secret", "SVC_AUTH_JWT_REFRESH_SECRET"},
 		{"notification.internal_api_secret", "SVC_NOTIFICATION_INTERNAL_API_SECRET"},
+		{"challenger.grpc_addr", "SVC_CHALLENGER_GRPC_ADDR"},
+		{"challenger.grpc_secret", "SVC_CHALLENGER_GRPC_SECRET"},
 	} {
 		if err := v.BindEnv(b[0], b[1]); err != nil {
 			return nil, fmt.Errorf("config: bind env %s: %w", b[1], err)
@@ -261,6 +276,9 @@ func validate(cfg *Config) error {
 	if s := cfg.Notification.InternalAPISecret; s != "" && len(s) < minInternalSecretLen {
 		return fmt.Errorf("config: SVC_NOTIFICATION_INTERNAL_API_SECRET must be ≥ %d bytes when set (got %d)", minInternalSecretLen, len(s))
 	}
+	if err := validateChallenger(cfg.Challenger); err != nil {
+		return err
+	}
 	if cfg.HTTPTimeout <= 0 {
 		return fmt.Errorf("config: SVC_HTTP_TIMEOUT must be positive (e.g. 30s)")
 	}
@@ -271,6 +289,19 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Pagination.MaxLimit < 1 {
 		return fmt.Errorf("config: SVC_PAGINATION_MAX_LIMIT must be ≥ 1 (got %d)", cfg.Pagination.MaxLimit)
+	}
+	return nil
+}
+
+func validateChallenger(c ChallengerConfig) error {
+	if c.GRPCAddr == "" || c.GRPCSecret == "" {
+		return fmt.Errorf("config: SVC_CHALLENGER_GRPC_ADDR and SVC_CHALLENGER_GRPC_SECRET are required")
+	}
+	if c.GRPCCallTimeout <= 0 {
+		return fmt.Errorf("config: SVC_CHALLENGER_GRPC_CALL_TIMEOUT must be positive (got %s)", c.GRPCCallTimeout)
+	}
+	if c.GRPCMaxAttempts < 1 {
+		return fmt.Errorf("config: SVC_CHALLENGER_GRPC_MAX_ATTEMPTS must be ≥ 1 (got %d)", c.GRPCMaxAttempts)
 	}
 	return nil
 }
