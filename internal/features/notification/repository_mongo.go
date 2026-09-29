@@ -109,6 +109,24 @@ func (r *mongoRepo) DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, e
 	return res.DeletedCount > 0, nil
 }
 
+// DeleteNotificationsByUser uses index `notifications_feed` (user_id prefix).
+func (r *mongoRepo) DeleteNotificationsByUser(ctx context.Context, userID bson.ObjectID) (int64, error) {
+	res, err := r.coll.DeleteMany(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return 0, fmt.Errorf("notification: delete user notifications: %w", err)
+	}
+	return res.DeletedCount, nil
+}
+
+// DeleteDevicesByUser uses index `devices_user_device` (user_id prefix).
+func (r *mongoRepo) DeleteDevicesByUser(ctx context.Context, userID bson.ObjectID) (int64, error) {
+	res, err := r.devices.DeleteMany(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return 0, fmt.Errorf("notification: delete user devices: %w", err)
+	}
+	return res.DeletedCount, nil
+}
+
 func (r *mongoRepo) findDevice(ctx context.Context, filter bson.M) (Device, bool, error) {
 	var d Device
 	err := r.devices.FindOne(ctx, filter).Decode(&d)

@@ -37,6 +37,11 @@ type RouterDeps struct {
 	IdempotencyCache middleware.IdempotencyCache // app.go wires the Valkey-backed adapter
 	HTTPTimeout      time.Duration               // global default request timeout; 0 = no timeout
 
+	// NotificationInternalSecret guards the account-deletion purge
+	// (DELETE /api/v1/internal/notifications/users/{user_id}) via
+	// middleware.SharedSecret. Empty → the route is not mounted (404).
+	NotificationInternalSecret string
+
 	// PayloadCapture opts the access log into recording request/response
 	// payloads. Zero value = capture nothing, which is the default in every
 	// environment. See config.HTTPLogConfig before turning any of it on.
@@ -121,6 +126,15 @@ func NewRouter(deps RouterDeps) http.Handler {
 			r.Mount("/notifications", deps.Notification.Routes())
 			r.Mount("/devices", deps.Notification.DeviceRoutes())
 		})
+
+		// Server-to-server routes: Internal-Secret instead of BearerAuth, no Idempotency
+		// (the purge is idempotent itself). Not mounted without a secret.
+		if deps.NotificationInternalSecret != "" {
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.SharedSecret(deps.NotificationInternalSecret))
+				deps.Notification.RegisterInternalRoutes(r)
+			})
+		}
 	})
 
 	// otelhttp at the OUTERMOST layer so it captures total latency and pulls

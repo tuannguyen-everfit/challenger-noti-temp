@@ -54,9 +54,10 @@ type mockRepo struct {
 	rangeCalls  []rangeCall
 	err         error
 
-	devices   map[bson.ObjectID]Device
-	deviceErr map[string]error // method name → injected error
-	audit     *mockAuditWriter
+	devices       map[bson.ObjectID]Device
+	notifications map[bson.ObjectID]Notification // rows the write paths change; the feed reads use feedPages
+	failOn        map[string]error               // method name → injected error
+	audit         *mockAuditWriter
 }
 
 type mockAuditWriter struct {
@@ -89,13 +90,13 @@ func (m *mockAuditWriter) restore(entries []AuditLog) {
 
 func (m *mockRepo) WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
 	m.mu.Lock()
-	devices := maps.Clone(m.devices)
+	devices, notifications := maps.Clone(m.devices), maps.Clone(m.notifications)
 	m.mu.Unlock()
 	entries := m.audit.snapshot()
 
 	if err := fn(ctx); err != nil {
 		m.mu.Lock()
-		m.devices = devices
+		m.devices, m.notifications = devices, notifications
 		m.mu.Unlock()
 		m.audit.restore(entries)
 		return err
@@ -106,7 +107,7 @@ func (m *mockRepo) WithTransaction(ctx context.Context, fn func(ctx context.Cont
 func (m *mockRepo) FindDevice(_ context.Context, userID bson.ObjectID, deviceID string) (Device, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.deviceErr["FindDevice"]; err != nil {
+	if err := m.failOn["FindDevice"]; err != nil {
 		return Device{}, false, err
 	}
 	for _, d := range m.devices {
@@ -120,7 +121,7 @@ func (m *mockRepo) FindDevice(_ context.Context, userID bson.ObjectID, deviceID 
 func (m *mockRepo) FindDeviceByToken(_ context.Context, token string) (Device, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.deviceErr["FindDeviceByToken"]; err != nil {
+	if err := m.failOn["FindDeviceByToken"]; err != nil {
 		return Device{}, false, err
 	}
 	for _, d := range m.devices {
@@ -134,7 +135,7 @@ func (m *mockRepo) FindDeviceByToken(_ context.Context, token string) (Device, b
 func (m *mockRepo) UpsertDevice(_ context.Context, d Device) (bson.ObjectID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.deviceErr["UpsertDevice"]; err != nil {
+	if err := m.failOn["UpsertDevice"]; err != nil {
 		return bson.ObjectID{}, err
 	}
 	var current *Device
@@ -158,7 +159,7 @@ func (m *mockRepo) UpsertDevice(_ context.Context, d Device) (bson.ObjectID, err
 func (m *mockRepo) TouchDevice(_ context.Context, id bson.ObjectID, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.deviceErr["TouchDevice"]; err != nil {
+	if err := m.failOn["TouchDevice"]; err != nil {
 		return err
 	}
 	d := m.devices[id]
@@ -170,12 +171,44 @@ func (m *mockRepo) TouchDevice(_ context.Context, id bson.ObjectID, at time.Time
 func (m *mockRepo) DeleteDevice(_ context.Context, id bson.ObjectID) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.deviceErr["DeleteDevice"]; err != nil {
+	if err := m.failOn["DeleteDevice"]; err != nil {
 		return false, err
 	}
 	_, ok := m.devices[id]
 	delete(m.devices, id)
 	return ok, nil
+}
+
+func (m *mockRepo) DeleteNotificationsByUser(_ context.Context, userID bson.ObjectID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.failOn["DeleteNotificationsByUser"]; err != nil {
+		return 0, err
+	}
+	var n int64
+	for id, row := range m.notifications {
+		if row.UserID == userID {
+			delete(m.notifications, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *mockRepo) DeleteDevicesByUser(_ context.Context, userID bson.ObjectID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.failOn["DeleteDevicesByUser"]; err != nil {
+		return 0, err
+	}
+	var n int64
+	for id, row := range m.devices {
+		if row.UserID == userID {
+			delete(m.devices, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // errDuplicateToken is what the unique `devices_token` index would raise.
@@ -217,7 +250,7 @@ func (m *mockRepo) CountRange(_ context.Context, userID bson.ObjectID, tab Tab, 
 }
 
 func newSvc(now time.Time) (*Service, *mockRepo) {
-	repo := &mockRepo{devices: map[bson.ObjectID]Device{}, audit: &mockAuditWriter{}}
+	repo := &mockRepo{devices: map[bson.ObjectID]Device{}, notifications: map[bson.ObjectID]Notification{}, audit: &mockAuditWriter{}}
 	svc := New(repo, repo.audit, Config{MaxListLimit: 100})
 	svc.now = frozenTime(now)
 	return svc, repo
@@ -786,7 +819,7 @@ func TestRegisterDevice_RepoErrorPropagates(t *testing.T) {
 			seedDevice(t, repo, Device{UserID: bson.NewObjectID(), DeviceID: "other", Token: "held"})
 			seedDevice(t, repo, Device{UserID: user, DeviceID: "same", Platform: PlatformIOS, Token: "same-tok"})
 			boom := errors.New("mongo down")
-			repo.deviceErr = map[string]error{method: boom}
+			repo.failOn = map[string]error{method: boom}
 
 			in := RegisterDeviceInput{UserID: user, DeviceID: "new", Platform: PlatformIOS, Token: "held"}
 			if method == "TouchDevice" {
@@ -859,7 +892,7 @@ func TestRemoveDevice_RepoErrorPropagates(t *testing.T) {
 			user := bson.NewObjectID()
 			seedDevice(t, repo, Device{UserID: user, DeviceID: "d-1", Token: "tok"})
 			boom := errors.New("mongo down")
-			repo.deviceErr = map[string]error{method: boom}
+			repo.failOn = map[string]error{method: boom}
 
 			if _, err := svc.RemoveDevice(context.Background(), RemoveDeviceInput{UserID: user, DeviceID: "d-1"}); !errors.Is(err, boom) {
 				t.Errorf("err = %v, want %v", err, boom)
@@ -924,5 +957,132 @@ func assertNoTokenInAudit(t *testing.T, entries []AuditLog, tokens ...string) {
 				t.Errorf("token %q leaked into audit entry %+v", tok, e)
 			}
 		}
+	}
+}
+
+const purgeCaller = "account-deletion"
+
+// seedNotifications stores n rows owned by userID.
+func seedNotifications(t *testing.T, repo *mockRepo, userID bson.ObjectID, n int) {
+	t.Helper()
+	for range n {
+		id := bson.NewObjectID()
+		repo.notifications[id] = Notification{ID: id, UserID: userID, Tab: TabSystem}
+	}
+}
+
+func countOwned(repo *mockRepo, userID bson.ObjectID) (notifications, devices int) {
+	for _, n := range repo.notifications {
+		if n.UserID == userID {
+			notifications++
+		}
+	}
+	for _, d := range repo.devices {
+		if d.UserID == userID {
+			devices++
+		}
+	}
+	return notifications, devices
+}
+
+func TestPurgeUser_DeletesBothAndAudits(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user, other := bson.NewObjectID(), bson.NewObjectID()
+	seedNotifications(t, repo, user, 12)
+	seedDevice(t, repo, Device{UserID: user, DeviceID: "phone", Token: "t1"})
+	seedDevice(t, repo, Device{UserID: user, DeviceID: "tablet", Token: "t2"})
+	seedNotifications(t, repo, other, 3)
+	seedDevice(t, repo, Device{UserID: other, DeviceID: "phone", Token: "t3"})
+	earlier := AuditLog{Entity: AuditEntityDevice, Action: AuditActionCreate, UserID: &user}
+	repo.audit.entries = []AuditLog{earlier}
+
+	got, err := svc.PurgeUser(context.Background(), PurgeUserInput{UserID: user, Caller: purgeCaller})
+	if err != nil {
+		t.Fatalf("PurgeUser: %v", err)
+	}
+	if got != (PurgeUserResult{Notifications: 12, Devices: 2}) {
+		t.Errorf("result = %+v, want {12 2}", got)
+	}
+	if n, d := countOwned(repo, user); n != 0 || d != 0 {
+		t.Errorf("user still owns %d notifications, %d devices", n, d)
+	}
+	if n, d := countOwned(repo, other); n != 3 || d != 1 {
+		t.Errorf("other user owns %d notifications, %d devices; want 3, 1", n, d)
+	}
+
+	entries := repo.audit.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d, want the earlier one kept + one purge", len(entries))
+	}
+	e := entries[1]
+	wantActor := Actor{Type: ActorTypeService, ID: purgeCaller, Via: actorViaInternalAPI}
+	if e.Entity != AuditEntityUser || e.EntityID != user.Hex() || e.Action != AuditActionPurge || e.Actor != wantActor {
+		t.Errorf("purge entry = %+v", e)
+	}
+	if e.UserID == nil || *e.UserID != user || e.Count != 14 || !e.At.Equal(deviceNow) || len(e.Changes) != 0 {
+		t.Errorf("purge entry user / count / at / changes = %v / %d / %v / %v", e.UserID, e.Count, e.At, e.Changes)
+	}
+}
+
+func TestPurgeUser_SecondCallIsNoOp(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	seedNotifications(t, repo, user, 2)
+	in := PurgeUserInput{UserID: user, Caller: purgeCaller}
+	if _, err := svc.PurgeUser(context.Background(), in); err != nil {
+		t.Fatalf("first PurgeUser: %v", err)
+	}
+
+	got, err := svc.PurgeUser(context.Background(), in)
+	if err != nil || got != (PurgeUserResult{}) {
+		t.Fatalf("second PurgeUser = %+v, %v; want zero counts, nil", got, err)
+	}
+	if n := len(repo.audit.snapshot()); n != 1 {
+		t.Errorf("audit entries = %d, want 1 (the second purge deleted nothing)", n)
+	}
+}
+
+func TestPurgeUser_AuditFailureDeletesNothing(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	seedNotifications(t, repo, user, 4)
+	seedDevice(t, repo, Device{UserID: user, DeviceID: "phone", Token: "t1"})
+	repo.audit.err = errors.New("audit down")
+
+	if _, err := svc.PurgeUser(context.Background(), PurgeUserInput{UserID: user, Caller: purgeCaller}); !errors.Is(err, repo.audit.err) {
+		t.Fatalf("err = %v, want the audit error", err)
+	}
+	if n, d := countOwned(repo, user); n != 4 || d != 1 {
+		t.Errorf("after a failed purge the user owns %d notifications, %d devices; want 4, 1", n, d)
+	}
+}
+
+func TestPurgeUser_RepoErrorPropagates(t *testing.T) {
+	for _, method := range []string{"DeleteNotificationsByUser", "DeleteDevicesByUser"} {
+		t.Run(method, func(t *testing.T) {
+			svc, repo := newSvc(deviceNow)
+			user := bson.NewObjectID()
+			seedNotifications(t, repo, user, 1)
+			seedDevice(t, repo, Device{UserID: user, DeviceID: "phone", Token: "t1"})
+			boom := errors.New("mongo down")
+			repo.failOn = map[string]error{method: boom}
+
+			if _, err := svc.PurgeUser(context.Background(), PurgeUserInput{UserID: user}); !errors.Is(err, boom) {
+				t.Errorf("err = %v, want %v", err, boom)
+			}
+			if n, d := countOwned(repo, user); n != 1 || d != 1 {
+				t.Errorf("rows after failure = %d, %d; want 1, 1", n, d)
+			}
+		})
+	}
+}
+
+func TestRecordAudit_SkipsEmptyPurge(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	if err := svc.recordAudit(context.Background(), AuditLog{Entity: AuditEntityUser, Action: AuditActionPurge}); err != nil {
+		t.Fatalf("recordAudit: %v", err)
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0 for a purge that deleted nothing", n)
 	}
 }

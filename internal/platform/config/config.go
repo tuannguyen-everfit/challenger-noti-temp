@@ -18,21 +18,22 @@ import (
 // (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, OTEL_TRACES_SAMPLER_ARG, …)
 // and are read by `internal/infra/otelx.Setup` directly from os.Getenv.
 type Config struct {
-	HTTPPort        int              `mapstructure:"http_port"`
-	HTTPTimeout     time.Duration    `mapstructure:"http_timeout"` // global per-request timeout
-	HTTPThrottle    ThrottleConfig   `mapstructure:"http_throttle"`
-	HTTPLog         HTTPLogConfig    `mapstructure:"http_log"`
-	LogLevel        string           `mapstructure:"log_level"`
-	LogFormat       string           `mapstructure:"log_format"`
-	Env             string           `mapstructure:"env"`        // APP_ENV — surfaced as app_env in /healthcheck + OTel deployment.environment
-	AppName         string           `mapstructure:"app_name"`   // APP_NAME, default "go-service-template" — surfaced in /healthcheck
-	AppRegion       string           `mapstructure:"app_region"` // APP_REGION, default "ap-southeast-1" — surfaced in /healthcheck
-	Mongo           MongoConfig      `mapstructure:"mongo"`
-	Valkey          ValkeyConfig     `mapstructure:"valkey"`
-	Kafka           KafkaConfig      `mapstructure:"kafka"`
-	Auth            AuthConfig       `mapstructure:"auth"`
-	Pagination      PaginationConfig `mapstructure:"pagination"`
-	ShutdownTimeout time.Duration    `mapstructure:"shutdown_timeout"`
+	HTTPPort        int                `mapstructure:"http_port"`
+	HTTPTimeout     time.Duration      `mapstructure:"http_timeout"` // global per-request timeout
+	HTTPThrottle    ThrottleConfig     `mapstructure:"http_throttle"`
+	HTTPLog         HTTPLogConfig      `mapstructure:"http_log"`
+	LogLevel        string             `mapstructure:"log_level"`
+	LogFormat       string             `mapstructure:"log_format"`
+	Env             string             `mapstructure:"env"`        // APP_ENV — surfaced as app_env in /healthcheck + OTel deployment.environment
+	AppName         string             `mapstructure:"app_name"`   // APP_NAME, default "go-service-template" — surfaced in /healthcheck
+	AppRegion       string             `mapstructure:"app_region"` // APP_REGION, default "ap-southeast-1" — surfaced in /healthcheck
+	Mongo           MongoConfig        `mapstructure:"mongo"`
+	Valkey          ValkeyConfig       `mapstructure:"valkey"`
+	Kafka           KafkaConfig        `mapstructure:"kafka"`
+	Auth            AuthConfig         `mapstructure:"auth"`
+	Pagination      PaginationConfig   `mapstructure:"pagination"`
+	Notification    NotificationConfig `mapstructure:"notification"`
+	ShutdownTimeout time.Duration      `mapstructure:"shutdown_timeout"`
 }
 
 // PaginationConfig holds shared cursor-pagination knobs applied across every
@@ -46,13 +47,27 @@ type PaginationConfig struct {
 }
 
 // AuthConfig holds the JWT secrets for platform/authtoken. Both secrets are
-// required at boot (validate) because every route this service serves is authed.
+// required at boot (validate) because every public route is Bearer-authed.
 type AuthConfig struct {
 	JWTAccessSecret  string        `mapstructure:"jwt_access_secret"`  // SVC_AUTH_JWT_ACCESS_SECRET
 	JWTRefreshSecret string        `mapstructure:"jwt_refresh_secret"` // SVC_AUTH_JWT_REFRESH_SECRET
 	JWTAccessTTL     time.Duration `mapstructure:"jwt_access_ttl"`     // default 1h
 	JWTRefreshTTL    time.Duration `mapstructure:"jwt_refresh_ttl"`    // default 720h (30d)
 }
+
+// NotificationConfig holds the notification feature's secrets.
+//
+// InternalAPISecret guards the account-deletion purge
+// DELETE /api/v1/internal/notifications/users/{user_id} (Internal-Secret header,
+// middleware.SharedSecret). Empty → the internal route is not mounted (404);
+// a set-but-mismatched secret is 401. Feature-namespaced like challenger's
+// CHALLENGER_LEADERBOARD_INTERNAL_API_SECRET: one secret per route family.
+type NotificationConfig struct {
+	InternalAPISecret string `mapstructure:"internal_api_secret"` // SVC_NOTIFICATION_INTERNAL_API_SECRET; empty disables the route
+}
+
+// minInternalSecretLen is the shortest accepted internal secret: it authorises a hard delete.
+const minInternalSecretLen = 32
 
 // ThrottleConfig bounds concurrent in-flight requests through /api/v1/*.
 // Health endpoints (/healthcheck, /liveness, /readiness) are NOT throttled.
@@ -207,6 +222,7 @@ func Load() (*Config, error) {
 		{"valkey.addr", "SVC_VALKEY_ADDR"},
 		{"auth.jwt_access_secret", "SVC_AUTH_JWT_ACCESS_SECRET"},
 		{"auth.jwt_refresh_secret", "SVC_AUTH_JWT_REFRESH_SECRET"},
+		{"notification.internal_api_secret", "SVC_NOTIFICATION_INTERNAL_API_SECRET"},
 	} {
 		if err := v.BindEnv(b[0], b[1]); err != nil {
 			return nil, fmt.Errorf("config: bind env %s: %w", b[1], err)
@@ -241,6 +257,9 @@ func validate(cfg *Config) error {
 	// Every route is Bearer-authed; missing secrets would otherwise surface as 404s.
 	if cfg.Auth.JWTAccessSecret == "" || cfg.Auth.JWTRefreshSecret == "" {
 		return fmt.Errorf("config: SVC_AUTH_JWT_ACCESS_SECRET and SVC_AUTH_JWT_REFRESH_SECRET are required")
+	}
+	if s := cfg.Notification.InternalAPISecret; s != "" && len(s) < minInternalSecretLen {
+		return fmt.Errorf("config: SVC_NOTIFICATION_INTERNAL_API_SECRET must be ≥ %d bytes when set (got %d)", minInternalSecretLen, len(s))
 	}
 	if cfg.HTTPTimeout <= 0 {
 		return fmt.Errorf("config: SVC_HTTP_TIMEOUT must be positive (e.g. 30s)")

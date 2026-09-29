@@ -12,6 +12,7 @@ The in-app notification centre for challenger users: a feed of cards in two tabs
 |---|---|
 | CHAL-399 | `GET /api/v1/notifications` (cursor feed) + `GET /api/v1/notifications/summary` (badge, tab dots, group counts). Read-only. Defines the `Notification` model. |
 | CHAL-401 | `PUT` / `DELETE /api/v1/devices/{device_id}` (push-token registration). First writer: `notification_devices`, `notification_audit_logs`, the transaction + audit helper, user-scoped idempotency. |
+| CHAL-402 | `DELETE /api/v1/internal/notifications/users/{user_id}` — account-deletion purge behind `Internal-Secret`. |
 
 ## ACs owned by CHAL-399
 
@@ -37,6 +38,17 @@ The in-app notification centre for challenger users: a feed of cards in two tabs
 | Validation | `platform=web`, empty token, `device_id` > 128 chars → 400 |
 | DoD | Tokens are never logged, audited or echoed |
 
+## ACs owned by CHAL-402
+
+| AC | Behaviour |
+|---|---|
+| Purge | 12 notifications + 2 devices → `{12, 2}` and one `purge` entry with `count = 14` |
+| Idempotent | A second call → `{0, 0}`, no entry |
+| Auth | Wrong / missing `Internal-Secret` → 401, nothing deleted; not reachable with a Bearer token |
+| Rollback | An audit failure deletes nothing (5xx) |
+| Isolation | Other users' rows are untouched; the purged user's existing audit entries are kept |
+| Off switch | No secret configured → route not mounted (404) |
+
 ## Not yet delivered
 
-Mark read / read-all, account-deletion purge, producers (Kafka ingest, Temporal time-driven kinds), push delivery.
+Mark read / read-all, producers (Kafka ingest, Temporal time-driven kinds), push delivery.
