@@ -19,6 +19,7 @@ type notificationService interface {
 	Summary(ctx context.Context, in SummaryInput) (SummaryResult, error)
 	RegisterDevice(ctx context.Context, in RegisterDeviceInput) (Device, error)
 	RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool, error)
+	PurgeUser(ctx context.Context, in PurgeUserInput) (PurgeUserResult, error)
 }
 
 // Handler serves the notification HTTP endpoints.
@@ -41,6 +42,11 @@ func (h *Handler) DeviceRoutes() chi.Router {
 	r.Put("/{device_id}", typed.JSON(http.StatusOK, h.RegisterDevice))
 	r.Delete("/{device_id}", typed.JSON(http.StatusOK, h.RemoveDevice))
 	return r
+}
+
+// RegisterInternalRoutes adds the server-to-server routes; the router guards them with Internal-Secret.
+func (h *Handler) RegisterInternalRoutes(r chi.Router) {
+	r.Delete("/internal/notifications/users/{user_id}", typed.JSON(http.StatusOK, h.PurgeUser))
 }
 
 // ListRequest is GET /notifications.
@@ -79,6 +85,18 @@ type DeviceResponse struct {
 // RemoveDeviceResponse reports whether a device row was deleted.
 type RemoveDeviceResponse struct {
 	Removed bool `json:"removed"`
+}
+
+// PurgeUserRequest is DELETE /internal/notifications/users/{user_id}.
+type PurgeUserRequest struct {
+	UserID string `path:"user_id"          validate:"required,len=24,hexadecimal"`
+	Caller string `header:"everfit-source" validate:"omitempty,max=64"`
+}
+
+// PurgeUserResponse counts what the purge deleted; both are 0 on a repeat call.
+type PurgeUserResponse struct {
+	DeletedNotifications int64 `json:"deleted_notifications"`
+	DeletedDevices       int64 `json:"deleted_devices"`
 }
 
 // FeedResponse is one feed page.
@@ -212,6 +230,19 @@ func (h *Handler) RemoveDevice(ctx context.Context, req RemoveDeviceRequest) (Re
 		return RemoveDeviceResponse{}, mapErr(err)
 	}
 	return RemoveDeviceResponse{Removed: removed}, nil
+}
+
+// PurgeUser handles DELETE /internal/notifications/users/{user_id} (account deletion).
+func (h *Handler) PurgeUser(ctx context.Context, req PurgeUserRequest) (PurgeUserResponse, error) {
+	userID, err := bson.ObjectIDFromHex(req.UserID)
+	if err != nil || userID.IsZero() {
+		return PurgeUserResponse{}, apperr.BadRequest(localization.CodeInvalidRequest, "user_id must be a non-zero ObjectID")
+	}
+	res, err := h.svc.PurgeUser(ctx, PurgeUserInput{UserID: userID, Caller: req.Caller})
+	if err != nil {
+		return PurgeUserResponse{}, mapErr(err)
+	}
+	return PurgeUserResponse{DeletedNotifications: res.Notifications, DeletedDevices: res.Devices}, nil
 }
 
 // parseCallerID reads the JWT `sub`; a non-hex or zero ObjectID is treated as unauthenticated.

@@ -175,3 +175,50 @@ func TestNewRouter_IdempotencyRunsAfterBearer(t *testing.T) {
 		t.Errorf("idempotency cache consulted %d times before auth, want 0", cache.gets)
 	}
 }
+
+const testInternalSecret = "internal-secret-for-router-tests-only"
+
+func newInternalTestRouter(secret string) http.Handler {
+	return NewRouter(RouterDeps{
+		Health:                     health.New(stubPinger{}, stubPinger{}, health.Meta{}),
+		Notification:               notification.NewHandler(nil),
+		AccessVerifier:             rejectingVerifier{},
+		IdempotencyCache:           noopIdempotencyCache{},
+		NotificationInternalSecret: secret,
+	})
+}
+
+func TestNewRouter_InternalPurge_NotMountedWithoutSecret(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/internal/notifications/users/x", nil)
+	req.Header.Set("Internal-Secret", "anything")
+	newInternalTestRouter("").ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 when the secret is unset", w.Code)
+	}
+}
+
+func TestNewRouter_InternalPurge_RequiresSecretNotBearer(t *testing.T) {
+	cases := map[string]struct {
+		secret string
+		want   int
+	}{
+		"missing secret": {"", http.StatusUnauthorized},
+		"wrong secret":   {"wrong", http.StatusUnauthorized},
+		// The right secret reaches the handler without a Bearer token: the malformed id is its 400.
+		"right secret": {testInternalSecret, http.StatusBadRequest},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodDelete, "/api/v1/internal/notifications/users/not-an-id", nil)
+			if tc.secret != "" {
+				req.Header.Set("Internal-Secret", tc.secret)
+			}
+			newInternalTestRouter(testInternalSecret).ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Errorf("status = %d, want %d; body %s", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+}

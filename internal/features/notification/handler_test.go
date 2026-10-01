@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
@@ -25,7 +27,17 @@ type mockNotificationService struct {
 	registerRes Device
 	removeIn    []RemoveDeviceInput
 	removeRes   bool
+	purgeIn     []PurgeUserInput
+	purgeRes    PurgeUserResult
 	err         error
+}
+
+func (m *mockNotificationService) PurgeUser(_ context.Context, in PurgeUserInput) (PurgeUserResult, error) {
+	m.purgeIn = append(m.purgeIn, in)
+	if m.err != nil {
+		return PurgeUserResult{}, m.err
+	}
+	return m.purgeRes, nil
 }
 
 func (m *mockNotificationService) RegisterDevice(_ context.Context, in RegisterDeviceInput) (Device, error) {
@@ -452,4 +464,76 @@ func TestRemoveDevice_ServiceError(t *testing.T) {
 	svc := &mockNotificationService{err: errors.New("mongo down")}
 	rec := serveDevices(t, svc, bson.NewObjectID().Hex(), http.MethodDelete, "/d-1", "")
 	assertError(t, rec, http.StatusInternalServerError, "INTERNAL_ERROR")
+}
+
+// serveInternal drives a request through RegisterInternalRoutes (the secret check is the router's job).
+func serveInternal(t *testing.T, svc *mockNotificationService, target string, header http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	r := chi.NewRouter()
+	NewHandler(svc).RegisterInternalRoutes(r)
+	req := httptest.NewRequest(http.MethodDelete, target, http.NoBody)
+	maps.Copy(req.Header, header)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestPurgeUser_PassesUserAndCaller(t *testing.T) {
+	user := bson.NewObjectID()
+	svc := &mockNotificationService{purgeRes: PurgeUserResult{Notifications: 12, Devices: 2}}
+
+	rec := serveInternal(t, svc, "/internal/notifications/users/"+user.Hex(), http.Header{"Everfit-Source": {"account-deletion"}})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if want := (PurgeUserInput{UserID: user, Caller: "account-deletion"}); len(svc.purgeIn) != 1 || svc.purgeIn[0] != want {
+		t.Fatalf("svc input = %+v, want %+v", svc.purgeIn, want)
+	}
+	body := decodeBody(t, rec)
+	if body["deleted_notifications"] != float64(12) || body["deleted_devices"] != float64(2) {
+		t.Errorf("body = %v", body)
+	}
+}
+
+func TestPurgeUser_CallerOptional(t *testing.T) {
+	svc := &mockNotificationService{}
+	rec := serveInternal(t, svc, "/internal/notifications/users/"+bson.NewObjectID().Hex(), nil)
+	if rec.Code != http.StatusOK || len(svc.purgeIn) != 1 || svc.purgeIn[0].Caller != "" {
+		t.Errorf("status = %d, input = %+v", rec.Code, svc.purgeIn)
+	}
+	if body := decodeBody(t, rec); body["deleted_notifications"] != float64(0) || body["deleted_devices"] != float64(0) {
+		t.Errorf("zero counts must still be on the wire: %v", body)
+	}
+}
+
+func TestPurgeUser_InvalidRequest(t *testing.T) {
+	cases := map[string]struct {
+		userID string
+		header http.Header
+	}{
+		"not hex":         {userID: "not-an-object-id-at-all!"},
+		"short":           {userID: "abc"},
+		"zero ObjectID":   {userID: bson.ObjectID{}.Hex()},
+		"caller too long": {userID: bson.NewObjectID().Hex(), header: http.Header{"Everfit-Source": {strings.Repeat("s", 65)}}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc := &mockNotificationService{}
+			rec := serveInternal(t, svc, "/internal/notifications/users/"+tc.userID, tc.header)
+			assertError(t, rec, http.StatusBadRequest, "INVALID_REQUEST")
+			if len(svc.purgeIn) != 0 {
+				t.Error("svc called on an invalid request")
+			}
+		})
+	}
+}
+
+func TestPurgeUser_ServiceError(t *testing.T) {
+	svc := &mockNotificationService{err: errors.New("audit write: mongo down")}
+	rec := serveInternal(t, svc, "/internal/notifications/users/"+bson.NewObjectID().Hex(), nil)
+	assertError(t, rec, http.StatusInternalServerError, "INTERNAL_ERROR")
+	if strings.Contains(rec.Body.String(), "mongo") {
+		t.Errorf("internal error leaked: %s", rec.Body.String())
+	}
 }

@@ -197,6 +197,7 @@ func TestValidate_Guards(t *testing.T) {
 		{"pagination limit must be >= 1", map[string]string{"SVC_PAGINATION_MAX_LIMIT": "0"}, "SVC_PAGINATION_MAX_LIMIT"},
 		{"jwt access secret required", map[string]string{"SVC_AUTH_JWT_ACCESS_SECRET": ""}, "SVC_AUTH_JWT_ACCESS_SECRET"},
 		{"jwt refresh secret required", map[string]string{"SVC_AUTH_JWT_REFRESH_SECRET": ""}, "SVC_AUTH_JWT_REFRESH_SECRET"},
+		{"internal secret too short", map[string]string{"SVC_NOTIFICATION_INTERNAL_API_SECRET": "short"}, "SVC_NOTIFICATION_INTERNAL_API_SECRET"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -283,5 +284,26 @@ func TestLoad_HTTPLogCapture_RejectsUncappedBodies(t *testing.T) {
 	t.Setenv("SVC_HTTP_LOG_MAX_FIELDS", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("want a boot failure when body capture has no field cap")
+	}
+}
+
+func TestLoad_Notification_InternalSecret(t *testing.T) {
+	setEnv(t, validBaseEnv())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if cfg.Notification.InternalAPISecret != "" {
+		t.Errorf("default secret = %q, want empty (internal route off)", cfg.Notification.InternalAPISecret)
+	}
+
+	env := validBaseEnv()
+	env["SVC_NOTIFICATION_INTERNAL_API_SECRET"] = strings.Repeat("s", minInternalSecretLen)
+	setEnv(t, env)
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load err: %v", err)
+	}
+	if cfg.Notification.InternalAPISecret != env["SVC_NOTIFICATION_INTERNAL_API_SECRET"] {
+		t.Errorf("secret = %q, want the env value", cfg.Notification.InternalAPISecret)
 	}
 }

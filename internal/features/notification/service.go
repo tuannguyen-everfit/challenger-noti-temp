@@ -1,4 +1,4 @@
-// Package notification serves the in-app notification feed, unread summary and push-device registry.
+// Package notification serves the in-app notification feed, unread summary, push-device registry and account-deletion purge.
 package notification
 
 import (
@@ -120,6 +120,7 @@ type AuditEntity string
 // AuditEntity values.
 const (
 	AuditEntityDevice AuditEntity = "device"
+	AuditEntityUser   AuditEntity = "user" // account-deletion purge
 )
 
 // AuditAction is what happened to the record.
@@ -130,10 +131,14 @@ const (
 	AuditActionCreate AuditAction = "create"
 	AuditActionUpdate AuditAction = "update"
 	AuditActionDelete AuditAction = "delete"
+	AuditActionPurge  AuditAction = "purge"
 )
 
-// actorViaAPI marks a write made through the public API (Actor.Via).
-const actorViaAPI = "api"
+// Actor.Via values.
+const (
+	actorViaAPI         = "api"          // public API, Bearer-authed caller
+	actorViaInternalAPI = "internal_api" // server-to-server route, Internal-Secret
+)
 
 // auditFieldMode says how an allow-listed field is recorded in AuditLog.Changes.
 type auditFieldMode int
@@ -176,6 +181,10 @@ type Repo interface {
 	TouchDevice(ctx context.Context, id bson.ObjectID, at time.Time) error
 	// DeleteDevice removes the row; false when it was already gone.
 	DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, error)
+	// DeleteNotificationsByUser hard-deletes every notification of the user and returns the count.
+	DeleteNotificationsByUser(ctx context.Context, userID bson.ObjectID) (int64, error)
+	// DeleteDevicesByUser hard-deletes every device of the user and returns the count.
+	DeleteDevicesByUser(ctx context.Context, userID bson.ObjectID) (int64, error)
 }
 
 // AuditWriter appends entries to notification_audit_logs; call it with a WithTransaction ctx.
@@ -336,6 +345,18 @@ type RemoveDeviceInput struct {
 	DeviceID string
 }
 
+// PurgeUserInput is the PurgeUser request; Caller is the calling service (`everfit-source`).
+type PurgeUserInput struct {
+	UserID bson.ObjectID
+	Caller string
+}
+
+// PurgeUserResult counts the rows PurgeUser deleted.
+type PurgeUserResult struct {
+	Notifications int64
+	Devices       int64
+}
+
 // feedCursor is the feed position over (activity_at DESC, _id DESC).
 type feedCursor struct {
 	ActivityAt time.Time
@@ -467,6 +488,27 @@ func (s *Service) RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool,
 	return removed, nil
 }
 
+// PurgeUser hard-deletes the user's notifications and devices with one `purge` entry, in one
+// transaction. Idempotent: a repeat deletes nothing and writes no entry. Audit entries are kept.
+func (s *Service) PurgeUser(ctx context.Context, in PurgeUserInput) (PurgeUserResult, error) {
+	now := s.now()
+	var out PurgeUserResult
+	err := s.runAudited(ctx, func(ctx context.Context) error {
+		var err error
+		if out.Notifications, err = s.repo.DeleteNotificationsByUser(ctx, in.UserID); err != nil {
+			return err
+		}
+		if out.Devices, err = s.repo.DeleteDevicesByUser(ctx, in.UserID); err != nil {
+			return err
+		}
+		return s.recordAudit(ctx, buildPurgeAudit(in, out, now))
+	})
+	if err != nil {
+		return PurgeUserResult{}, fmt.Errorf("purge user: %w", err)
+	}
+	return out, nil
+}
+
 func (s *Service) registerDevice(ctx context.Context, in RegisterDeviceInput, now time.Time) (Device, error) {
 	actor := buildUserActor(in.UserID)
 	current, found, err := s.repo.FindDevice(ctx, in.UserID, in.DeviceID)
@@ -529,10 +571,10 @@ func (s *Service) runAudited(ctx context.Context, fn func(ctx context.Context) e
 }
 
 // recordAudit writes e inside the caller's transaction with the allow-listed changes and the
-// request / trace ids from ctx. An update with nothing left to record writes no entry.
+// request / trace ids from ctx. A no-op (see auditIsNoOp) writes no entry.
 func (s *Service) recordAudit(ctx context.Context, e AuditLog) error {
 	e.Changes = pickAuditChanges(e.Entity, e.Changes)
-	if e.Action == AuditActionUpdate && len(e.Changes) == 0 && e.Count == 0 {
+	if auditIsNoOp(e) {
 		return nil
 	}
 	e.RequestID = middleware.RequestIDFromContext(ctx)
@@ -660,6 +702,33 @@ func buildDeviceAudit(d Device, action AuditAction, actor Actor, changes map[str
 		Changes:  changes,
 		At:       at,
 	}
+}
+
+func buildPurgeAudit(in PurgeUserInput, res PurgeUserResult, at time.Time) AuditLog {
+	owner := in.UserID
+	return AuditLog{
+		Entity:   AuditEntityUser,
+		EntityID: in.UserID.Hex(),
+		UserID:   &owner,
+		Action:   AuditActionPurge,
+		Actor:    Actor{Type: ActorTypeService, ID: in.Caller, Via: actorViaInternalAPI},
+		Count:    int(res.Notifications + res.Devices),
+		At:       at,
+	}
+}
+
+// auditIsNoOp reports an entry that records nothing: an update without an allow-listed change
+// or a count, or a purge that deleted no row.
+func auditIsNoOp(e AuditLog) bool {
+	switch e.Action {
+	case AuditActionUpdate:
+		return len(e.Changes) == 0 && e.Count == 0
+	case AuditActionPurge:
+		return e.Count == 0
+	case AuditActionCreate, AuditActionDelete:
+		return false
+	}
+	return false
 }
 
 // pickAuditChanges keeps the entity's allow-listed fields; masked fields keep only `changed: true`.

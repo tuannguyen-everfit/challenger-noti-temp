@@ -84,14 +84,15 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	})
 
 	router := httpx.NewRouter(httpx.RouterDeps{
-		Health:                 healthHandler,
-		Notification:           notificationHandler,
-		AccessVerifier:         accessVerifier,
-		IdempotencyCache:       newValkeyIdempotencyCache(valkeyClient),
-		HTTPTimeout:            cfg.HTTPTimeout,
-		ThrottleMax:            cfg.HTTPThrottle.Max,
-		ThrottleBacklog:        cfg.HTTPThrottle.Backlog,
-		ThrottleBacklogTimeout: cfg.HTTPThrottle.BacklogTimeout,
+		Health:                     healthHandler,
+		Notification:               notificationHandler,
+		AccessVerifier:             accessVerifier,
+		IdempotencyCache:           newValkeyIdempotencyCache(valkeyClient),
+		NotificationInternalSecret: cfg.Notification.InternalAPISecret,
+		HTTPTimeout:                cfg.HTTPTimeout,
+		ThrottleMax:                cfg.HTTPThrottle.Max,
+		ThrottleBacklog:            cfg.HTTPThrottle.Backlog,
+		ThrottleBacklogTimeout:     cfg.HTTPThrottle.BacklogTimeout,
 		PayloadCapture: middleware.PayloadCapture{
 			Bodies:      cfg.HTTPLog.Bodies,
 			Query:       cfg.HTTPLog.Query,
@@ -132,8 +133,8 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 }
 
 // newAccessVerifier builds the JWT signer that backs middleware.BearerAuth.
-// Both secrets are required (config.validate enforces it) because every route
-// this service serves is authed.
+// Both secrets are required (config.validate enforces it) because every public
+// route is Bearer-authed.
 func newAccessVerifier(cfg config.AuthConfig) (middleware.AccessVerifier, error) {
 	signer, err := authtoken.New(authtoken.Config{
 		AccessSecret:  cfg.JWTAccessSecret,
