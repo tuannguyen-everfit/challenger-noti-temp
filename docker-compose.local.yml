@@ -42,6 +42,10 @@ services:
       # Dev-only JWT secrets — boot fails without them (config.validate).
       SVC_AUTH_JWT_ACCESS_SECRET: local-access-secret-dev-only
       SVC_AUTH_JWT_REFRESH_SECRET: local-refresh-secret-dev-only
+      # challenger's internal gRPC (mark-read navigate). Boot needs both; the
+      # dial is lazy, so without a local challenger only mark-read 503s.
+      SVC_CHALLENGER_GRPC_ADDR: "dns:///host.docker.internal:7992"
+      SVC_CHALLENGER_GRPC_SECRET: local-grpc-secret-dev-only
       # OTel: NOT set here on purpose. With OTEL_EXPORTER_OTLP_ENDPOINT unset,
       # otelx.Setup goes into "local-only" mode (spans created for log↔trace
       # correlation, but nothing exported). `make compose-up-signoz` adds

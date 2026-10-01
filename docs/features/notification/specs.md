@@ -13,6 +13,7 @@ The in-app notification centre for challenger users: a feed of cards in two tabs
 | CHAL-399 | `GET /api/v1/notifications` (cursor feed) + `GET /api/v1/notifications/summary` (badge, tab dots, group counts). Read-only. Defines the `Notification` model. |
 | CHAL-401 | `PUT` / `DELETE /api/v1/devices/{device_id}` (push-token registration). First writer: `notification_devices`, `notification_audit_logs`, the transaction + audit helper, user-scoped idempotency. |
 | CHAL-402 | `DELETE /api/v1/internal/notifications/users/{user_id}` — account-deletion purge behind `Internal-Secret`. |
+| CHAL-400 | `POST /api/v1/notifications/{id}/read` + `POST /api/v1/notifications/read-all`; navigate resolved at read time over challenger's internal gRPC (`internal/infra/challengerclient`). |
 
 ## ACs owned by CHAL-399
 
@@ -49,6 +50,19 @@ The in-app notification centre for challenger users: a feed of cards in two tabs
 | Isolation | Other users' rows are untouched; the purged user's existing audit entries are kept |
 | Off switch | No secret configured → route not mounted (404) |
 
+## ACs owned by CHAL-400
+
+| AC | Behaviour |
+|---|---|
+| 0.11 / 1.x | `jump_in` marks read, clears buttons, navigates to `challenge_detail`, records `read_action = jump_in`, writes 1 entry |
+| Ended | For an ended challenge the tap → `leaderboard`; a re-tap writes no new entry |
+| 0.12 | Deleted challenge or lost access → `navigate: none`, `available: false`; the row is still read |
+| 1.5 | `nah` still hides the buttons |
+| Isolation | Another user's id → 404, no entry |
+| 0.9 | 7 unread → read-all makes all 7 read, keeps the buttons, writes 1 entry with `count = 7` |
+| Rollback | An audit failure rolls the read back |
+| Outage | Challenger unavailable → 503 |
+
 ## Not yet delivered
 
-Mark read / read-all, producers (Kafka ingest, Temporal time-driven kinds), push delivery.
+Producers (Kafka ingest, Temporal time-driven kinds), push delivery.

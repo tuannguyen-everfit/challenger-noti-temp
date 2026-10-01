@@ -140,3 +140,33 @@ func TestFieldChange_BSON(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildMarkAllReadFilter(t *testing.T) {
+	user := bson.NewObjectID()
+	want := bson.M{"user_id": user, "tab": bson.M{"$in": bson.A{TabActivities, TabSystem}}, "read_at": nil}
+	if got := buildMarkAllReadFilter(user); !reflect.DeepEqual(got, want) {
+		t.Errorf("buildMarkAllReadFilter = %v, want %v", got, want)
+	}
+}
+
+func TestBuildReadSet(t *testing.T) {
+	at := time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+	actor := Actor{Type: ActorTypeUser, ID: "u", Via: actorViaAPI}
+	cases := []struct {
+		name string
+		in   readUpdate
+		want bson.M
+	}{
+		{"first read with buttons", readUpdate{ReadAt: &at, ReadAction: ReadActionJumpIn, ButtonsHiddenAt: &at, UpdatedAt: at, UpdatedBy: actor},
+			bson.M{"read_at": at, "read_action": ReadActionJumpIn, "buttons_hidden_at": at, "updated_at": at, "updated_by": actor}},
+		{"buttons only", readUpdate{ButtonsHiddenAt: &at, UpdatedAt: at, UpdatedBy: actor},
+			bson.M{"buttons_hidden_at": at, "updated_at": at, "updated_by": actor}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildReadSet(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("buildReadSet = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

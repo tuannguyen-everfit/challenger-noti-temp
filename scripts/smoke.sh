@@ -72,6 +72,9 @@ export SVC_SHUTDOWN_TIMEOUT="5s"
 export SVC_AUTH_JWT_ACCESS_SECRET="smoke-access-secret-dev-only"
 export SVC_AUTH_JWT_REFRESH_SECRET="smoke-refresh-secret-dev-only"
 export SVC_NOTIFICATION_INTERNAL_API_SECRET="smoke-internal-secret-dev-only-0123456789"
+# No challenger in the smoke stack; the dial is lazy, so boot and every non-read route work.
+export SVC_CHALLENGER_GRPC_ADDR="dns:///localhost:1"
+export SVC_CHALLENGER_GRPC_SECRET="smoke-grpc-secret-dev-only"
 unset OTEL_EXPORTER_OTLP_ENDPOINT SVC_KAFKA_BROKERS
 
 echo "==> integration tests + per-file gate against real containers"
@@ -101,6 +104,7 @@ check "GET /nope → 404 envelope" 404 GET /nope .code ROUTE_NOT_FOUND
 check "GET /api/v1/nope → 404 through throttle + idempotency" 404 GET /api/v1/nope .code ROUTE_NOT_FOUND
 check "GET /api/v1/notifications without token → 401" 401 GET /api/v1/notifications .code AUTH_TOKEN_MISSING
 check "PUT /api/v1/devices/x without token → 401" 401 PUT /api/v1/devices/x .code AUTH_TOKEN_MISSING
+check "POST /api/v1/notifications/read-all without token → 401" 401 POST /api/v1/notifications/read-all .code AUTH_TOKEN_MISSING
 check "DELETE /api/v1/internal/notifications/users/x without Internal-Secret → 401" 401 DELETE /api/v1/internal/notifications/users/x .code AUTH_REQUIRED
 check "POST /healthcheck → 405 envelope" 405 POST /healthcheck .code METHOD_NOT_ALLOWED
 
