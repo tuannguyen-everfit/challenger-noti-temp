@@ -17,6 +17,8 @@ import (
 type notificationService interface {
 	ListFeed(ctx context.Context, in ListFeedInput) (ListFeedResult, error)
 	Summary(ctx context.Context, in SummaryInput) (SummaryResult, error)
+	RegisterDevice(ctx context.Context, in RegisterDeviceInput) (Device, error)
+	RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool, error)
 }
 
 // Handler serves the notification HTTP endpoints.
@@ -25,11 +27,19 @@ type Handler struct{ svc notificationService }
 // NewHandler builds the Handler.
 func NewHandler(svc notificationService) *Handler { return &Handler{svc: svc} }
 
-// Routes returns the feature sub-router; every route requires Bearer auth.
+// Routes returns the /notifications sub-router; every route requires Bearer auth.
 func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", typed.JSON(http.StatusOK, h.List))
 	r.Get("/summary", typed.JSON(http.StatusOK, h.Summary))
+	return r
+}
+
+// DeviceRoutes returns the /devices sub-router; every route requires Bearer auth.
+func (h *Handler) DeviceRoutes() chi.Router {
+	r := chi.NewRouter()
+	r.Put("/{device_id}", typed.JSON(http.StatusOK, h.RegisterDevice))
+	r.Delete("/{device_id}", typed.JSON(http.StatusOK, h.RemoveDevice))
 	return r
 }
 
@@ -44,6 +54,31 @@ type ListRequest struct {
 type SummaryRequest struct {
 	Tab string `query:"tab" validate:"omitempty,oneof=all activities system"`
 	TZ  string `query:"tz"  validate:"omitempty,max=64"`
+}
+
+// RegisterDeviceRequest is PUT /devices/{device_id}.
+type RegisterDeviceRequest struct {
+	DeviceID   string `path:"device_id"             validate:"required,max=128"`
+	Platform   string `json:"platform"              validate:"required,oneof=ios android"`
+	Token      string `json:"token"                 validate:"required,max=4096"`
+	AppVersion string `json:"app_version,omitempty" validate:"omitempty,max=64"`
+}
+
+// RemoveDeviceRequest is DELETE /devices/{device_id}.
+type RemoveDeviceRequest struct {
+	DeviceID string `path:"device_id" validate:"required,max=128"`
+}
+
+// DeviceResponse is the registered device on the wire; the token is never echoed.
+type DeviceResponse struct {
+	DeviceID  string    `json:"device_id"`
+	Platform  string    `json:"platform"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// RemoveDeviceResponse reports whether a device row was deleted.
+type RemoveDeviceResponse struct {
+	Removed bool `json:"removed"`
 }
 
 // FeedResponse is one feed page.
@@ -107,6 +142,12 @@ func (FeedResponse) ResponseHeaders() http.Header { return buildPrivateNoStore()
 // ResponseHeaders keeps the personalised summary out of shared caches.
 func (SummaryResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
 
+// ResponseHeaders keeps the caller's device out of shared caches.
+func (DeviceResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
+
+// ResponseHeaders keeps the caller's device result out of shared caches.
+func (RemoveDeviceResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
+
 // List handles GET /notifications.
 func (h *Handler) List(ctx context.Context, req ListRequest) (FeedResponse, error) {
 	userID, err := parseCallerID(ctx)
@@ -139,6 +180,38 @@ func (h *Handler) Summary(ctx context.Context, req SummaryRequest) (SummaryRespo
 		return SummaryResponse{}, mapErr(err)
 	}
 	return toSummaryResponse(res), nil
+}
+
+// RegisterDevice handles PUT /devices/{device_id}.
+func (h *Handler) RegisterDevice(ctx context.Context, req RegisterDeviceRequest) (DeviceResponse, error) {
+	userID, err := parseCallerID(ctx)
+	if err != nil {
+		return DeviceResponse{}, err
+	}
+	d, err := h.svc.RegisterDevice(ctx, RegisterDeviceInput{
+		UserID:     userID,
+		DeviceID:   req.DeviceID,
+		Platform:   Platform(req.Platform),
+		Token:      req.Token,
+		AppVersion: req.AppVersion,
+	})
+	if err != nil {
+		return DeviceResponse{}, mapErr(err)
+	}
+	return DeviceResponse{DeviceID: d.DeviceID, Platform: string(d.Platform), UpdatedAt: d.UpdatedAt}, nil
+}
+
+// RemoveDevice handles DELETE /devices/{device_id}; an unknown device is 200 with removed=false.
+func (h *Handler) RemoveDevice(ctx context.Context, req RemoveDeviceRequest) (RemoveDeviceResponse, error) {
+	userID, err := parseCallerID(ctx)
+	if err != nil {
+		return RemoveDeviceResponse{}, err
+	}
+	removed, err := h.svc.RemoveDevice(ctx, RemoveDeviceInput{UserID: userID, DeviceID: req.DeviceID})
+	if err != nil {
+		return RemoveDeviceResponse{}, mapErr(err)
+	}
+	return RemoveDeviceResponse{Removed: removed}, nil
 }
 
 // parseCallerID reads the JWT `sub`; a non-hex or zero ObjectID is treated as unauthenticated.

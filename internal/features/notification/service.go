@@ -1,17 +1,20 @@
-// Package notification serves the in-app notification feed and unread summary.
+// Package notification serves the in-app notification feed, unread summary and push-device registry.
 package notification
 
 import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
+	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
 	"github.com/Everfit-io/go-service-template/internal/platform/localization"
 	"github.com/Everfit-io/go-service-template/internal/platform/pagination"
 	"github.com/Everfit-io/go-service-template/internal/stdx/safego"
@@ -102,6 +105,49 @@ const (
 	ReadActionReadAll ReadAction = "read_all"
 )
 
+// Platform is the OS a push token belongs to.
+type Platform string
+
+// Platform values.
+const (
+	PlatformIOS     Platform = "ios"
+	PlatformAndroid Platform = "android"
+)
+
+// AuditEntity is the kind of record an audit entry is about.
+type AuditEntity string
+
+// AuditEntity values.
+const (
+	AuditEntityDevice AuditEntity = "device"
+)
+
+// AuditAction is what happened to the record.
+type AuditAction string
+
+// AuditAction values.
+const (
+	AuditActionCreate AuditAction = "create"
+	AuditActionUpdate AuditAction = "update"
+	AuditActionDelete AuditAction = "delete"
+)
+
+// actorViaAPI marks a write made through the public API (Actor.Via).
+const actorViaAPI = "api"
+
+// auditFieldMode says how an allow-listed field is recorded in AuditLog.Changes.
+type auditFieldMode int
+
+const (
+	auditFieldValue  auditFieldMode = iota + 1 // from / to values
+	auditFieldMasked                           // `changed: true` only — the value is a secret
+)
+
+// auditFields is the per-entity allow-list for AuditLog.Changes; anything else is dropped.
+var auditFields = map[AuditEntity]map[string]auditFieldMode{
+	AuditEntityDevice: {"platform": auditFieldValue, "app_version": auditFieldValue, "token": auditFieldMasked},
+}
+
 // summaryCountCap bounds every summary count: clients render ≥ 100 as "99+".
 const summaryCountCap = 100
 
@@ -116,6 +162,26 @@ type Repo interface {
 	CountUnread(ctx context.Context, userID bson.ObjectID, tab Tab) (int64, error)
 	// CountRange returns ≤ summaryCountCap rows with activity_at in [from, to); a zero bound is unbounded.
 	CountRange(ctx context.Context, userID bson.ObjectID, tab Tab, from, to time.Time) (int64, error)
+
+	// WithTransaction runs fn in one transaction: Repo and AuditWriter calls made with fn's ctx
+	// commit or roll back together. fn may run more than once (transient-error retry).
+	WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+	// FindDevice returns the user's row for deviceID; false when there is none.
+	FindDevice(ctx context.Context, userID bson.ObjectID, deviceID string) (Device, bool, error)
+	// FindDeviceByToken returns the row holding token (tokens are unique); false when there is none.
+	FindDeviceByToken(ctx context.Context, token string) (Device, bool, error)
+	// UpsertDevice writes d on (user_id, device_id) and returns the row _id; created_* apply on insert only.
+	UpsertDevice(ctx context.Context, d Device) (bson.ObjectID, error)
+	// TouchDevice moves last_registered_at and nothing else.
+	TouchDevice(ctx context.Context, id bson.ObjectID, at time.Time) error
+	// DeleteDevice removes the row; false when it was already gone.
+	DeleteDevice(ctx context.Context, id bson.ObjectID) (bool, error)
+}
+
+// AuditWriter appends entries to notification_audit_logs; call it with a WithTransaction ctx.
+type AuditWriter interface {
+	// Write inserts e; a duplicate audit_key returns errAuditRecorded.
+	Write(ctx context.Context, e AuditLog) error
 }
 
 // Config holds the feature's operational knobs, mapped from platform config in app.go.
@@ -123,16 +189,17 @@ type Config struct {
 	MaxListLimit int
 }
 
-// Service owns the feed and summary read paths.
+// Service owns the feed, summary and device paths.
 type Service struct {
-	repo Repo
-	cfg  Config
-	now  func() time.Time
+	repo  Repo
+	audit AuditWriter
+	cfg   Config
+	now   func() time.Time
 }
 
 // New builds the Service.
-func New(repo Repo, cfg Config) *Service {
-	return &Service{repo: repo, cfg: cfg, now: timex.Now}
+func New(repo Repo, audit AuditWriter, cfg Config) *Service {
+	return &Service{repo: repo, audit: audit, cfg: cfg, now: timex.Now}
 }
 
 // Notification is one card in a user's feed.
@@ -213,6 +280,60 @@ type PushState struct {
 	FailedCount   int        `bson:"failed_count"`
 	Error         string     `bson:"error,omitempty"`
 	SkippedReason string     `bson:"skipped_reason,omitempty"`
+}
+
+// Device is one push target: a (user, device) pair holding one FCM token.
+type Device struct {
+	ID               bson.ObjectID `bson:"_id,omitempty"`
+	UserID           bson.ObjectID `bson:"user_id"`
+	DeviceID         string        `bson:"device_id"` // client-generated; the JWT carries no device claim
+	Platform         Platform      `bson:"platform"`
+	Token            string        `bson:"token"` // never logged or audited
+	AppVersion       string        `bson:"app_version,omitempty"`
+	LastRegisteredAt time.Time     `bson:"last_registered_at"` // every PUT; stale-token cleanup reads this, not updated_at
+	CreatedBy        Actor         `bson:"created_by"`
+	CreatedAt        time.Time     `bson:"created_at,omitempty"`
+	UpdatedBy        *Actor        `bson:"updated_by,omitempty"`
+	UpdatedAt        time.Time     `bson:"updated_at,omitempty"`
+}
+
+// AuditLog is one append-only entry in notification_audit_logs.
+type AuditLog struct {
+	ID        bson.ObjectID          `bson:"_id,omitempty"`
+	Entity    AuditEntity            `bson:"entity"`
+	EntityID  string                 `bson:"entity_id"` // "" for bulk entries
+	UserID    *bson.ObjectID         `bson:"user_id,omitempty"`
+	Action    AuditAction            `bson:"action"`
+	Actor     Actor                  `bson:"actor"`
+	Changes   map[string]FieldChange `bson:"changes,omitempty"`
+	Count     int                    `bson:"count,omitempty"`
+	Ref       string                 `bson:"ref,omitempty"`
+	AuditKey  string                 `bson:"audit_key,omitempty"` // set by retried writers only
+	RequestID string                 `bson:"request_id,omitempty"`
+	TraceID   string                 `bson:"trace_id,omitempty"`
+	At        time.Time              `bson:"at"`
+}
+
+// FieldChange is one allow-listed field's value before and after a write.
+type FieldChange struct {
+	From    any  `bson:"from,omitempty"`
+	To      any  `bson:"to,omitempty"`
+	Changed bool `bson:"changed,omitempty"` // replaces From / To for masked fields
+}
+
+// RegisterDeviceInput is the RegisterDevice request.
+type RegisterDeviceInput struct {
+	UserID     bson.ObjectID
+	DeviceID   string
+	Platform   Platform
+	Token      string
+	AppVersion string
+}
+
+// RemoveDeviceInput is the RemoveDevice request.
+type RemoveDeviceInput struct {
+	UserID   bson.ObjectID
+	DeviceID string
 }
 
 // feedCursor is the feed position over (activity_at DESC, _id DESC).
@@ -309,6 +430,121 @@ func (s *Service) Summary(ctx context.Context, in SummaryInput) (SummaryResult, 
 	return out, nil
 }
 
+// RegisterDevice upserts the caller's device and evicts any other row holding the token, in one
+// transaction with the audit entries. A PUT that changes nothing moves last_registered_at only.
+func (s *Service) RegisterDevice(ctx context.Context, in RegisterDeviceInput) (Device, error) {
+	now := s.now()
+	var out Device
+	err := s.runAudited(ctx, func(ctx context.Context) error {
+		var err error
+		out, err = s.registerDevice(ctx, in, now)
+		return err
+	})
+	if err != nil {
+		return Device{}, fmt.Errorf("register device: %w", err)
+	}
+	return out, nil
+}
+
+// RemoveDevice deletes the caller's device; false (and no audit entry) when there is none.
+func (s *Service) RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool, error) {
+	now := s.now()
+	var removed bool
+	err := s.runAudited(ctx, func(ctx context.Context) error {
+		removed = false
+		current, found, err := s.repo.FindDevice(ctx, in.UserID, in.DeviceID)
+		if err != nil || !found {
+			return err
+		}
+		if removed, err = s.repo.DeleteDevice(ctx, current.ID); err != nil || !removed {
+			return err
+		}
+		return s.recordAudit(ctx, buildDeviceAudit(current, AuditActionDelete, buildUserActor(in.UserID), nil, now))
+	})
+	if err != nil {
+		return false, fmt.Errorf("remove device: %w", err)
+	}
+	return removed, nil
+}
+
+func (s *Service) registerDevice(ctx context.Context, in RegisterDeviceInput, now time.Time) (Device, error) {
+	actor := buildUserActor(in.UserID)
+	current, found, err := s.repo.FindDevice(ctx, in.UserID, in.DeviceID)
+	if err != nil {
+		return Device{}, err
+	}
+	changes := buildDeviceChanges(current, in)
+	if found && len(changes) == 0 {
+		if err := s.repo.TouchDevice(ctx, current.ID, now); err != nil {
+			return Device{}, err
+		}
+		current.LastRegisteredAt = now
+		return current, nil
+	}
+	// The token index is unique, so the old holder must go before the upsert.
+	if err := s.evictToken(ctx, in, actor, now); err != nil {
+		return Device{}, err
+	}
+
+	next := Device{
+		ID: current.ID, UserID: in.UserID, DeviceID: in.DeviceID, Platform: in.Platform, Token: in.Token,
+		AppVersion: in.AppVersion, LastRegisteredAt: now, CreatedBy: actor, CreatedAt: now, UpdatedBy: &actor, UpdatedAt: now,
+	}
+	if next.ID, err = s.repo.UpsertDevice(ctx, next); err != nil {
+		return Device{}, err
+	}
+	action := AuditActionCreate
+	if found {
+		next.CreatedBy, next.CreatedAt = current.CreatedBy, current.CreatedAt
+		action = AuditActionUpdate
+	} else {
+		changes = nil
+	}
+	if err := s.recordAudit(ctx, buildDeviceAudit(next, action, actor, changes, now)); err != nil {
+		return Device{}, err
+	}
+	return next, nil
+}
+
+// evictToken deletes the row holding in.Token when it isn't the caller's (user, device) row.
+func (s *Service) evictToken(ctx context.Context, in RegisterDeviceInput, actor Actor, now time.Time) error {
+	holder, found, err := s.repo.FindDeviceByToken(ctx, in.Token)
+	if err != nil || !found || (holder.UserID == in.UserID && holder.DeviceID == in.DeviceID) {
+		return err
+	}
+	deleted, err := s.repo.DeleteDevice(ctx, holder.ID)
+	if err != nil || !deleted {
+		return err
+	}
+	return s.recordAudit(ctx, buildDeviceAudit(holder, AuditActionDelete, actor, nil, now))
+}
+
+// runAudited runs fn in one transaction. errAuditRecorded means a retried write that already
+// committed, so it is success; only writers that set AuditKey (and return nothing) can hit it.
+func (s *Service) runAudited(ctx context.Context, fn func(ctx context.Context) error) error {
+	if err := s.repo.WithTransaction(ctx, fn); err != nil && !errors.Is(err, errAuditRecorded) {
+		return err
+	}
+	return nil
+}
+
+// recordAudit writes e inside the caller's transaction with the allow-listed changes and the
+// request / trace ids from ctx. An update with nothing left to record writes no entry.
+func (s *Service) recordAudit(ctx context.Context, e AuditLog) error {
+	e.Changes = pickAuditChanges(e.Entity, e.Changes)
+	if e.Action == AuditActionUpdate && len(e.Changes) == 0 && e.Count == 0 {
+		return nil
+	}
+	e.RequestID = middleware.RequestIDFromContext(ctx)
+	if sc := trace.SpanContextFromContext(ctx); sc.HasTraceID() {
+		e.TraceID = sc.TraceID().String()
+	}
+	if err := s.audit.Write(ctx, e); err != nil {
+		return fmt.Errorf("write %s %s audit: %w", e.Entity, e.Action, err)
+	}
+	return nil
+}
+
 func (s *Service) computeListLimit(limit int) int {
 	if limit > 0 {
 		return limit
@@ -392,4 +628,54 @@ func parseTimezone(name string) (*time.Location, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidTimezone, err)
 	}
 	return loc, nil
+}
+
+func buildUserActor(userID bson.ObjectID) Actor {
+	return Actor{Type: ActorTypeUser, ID: userID.Hex(), Via: actorViaAPI}
+}
+
+// buildDeviceChanges lists the audited fields that in changes on prev.
+func buildDeviceChanges(prev Device, in RegisterDeviceInput) map[string]FieldChange {
+	changes := map[string]FieldChange{}
+	if prev.Platform != in.Platform {
+		changes["platform"] = FieldChange{From: prev.Platform, To: in.Platform}
+	}
+	if prev.AppVersion != in.AppVersion {
+		changes["app_version"] = FieldChange{From: prev.AppVersion, To: in.AppVersion}
+	}
+	if prev.Token != in.Token {
+		changes["token"] = FieldChange{Changed: true}
+	}
+	return changes
+}
+
+func buildDeviceAudit(d Device, action AuditAction, actor Actor, changes map[string]FieldChange, at time.Time) AuditLog {
+	owner := d.UserID
+	return AuditLog{
+		Entity:   AuditEntityDevice,
+		EntityID: d.ID.Hex(),
+		UserID:   &owner,
+		Action:   action,
+		Actor:    actor,
+		Changes:  changes,
+		At:       at,
+	}
+}
+
+// pickAuditChanges keeps the entity's allow-listed fields; masked fields keep only `changed: true`.
+func pickAuditChanges(entity AuditEntity, changes map[string]FieldChange) map[string]FieldChange {
+	allowed := auditFields[entity]
+	out := make(map[string]FieldChange, len(changes))
+	for field, c := range changes {
+		switch allowed[field] {
+		case auditFieldValue:
+			out[field] = FieldChange{From: c.From, To: c.To}
+		case auditFieldMasked:
+			out[field] = FieldChange{Changed: true}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

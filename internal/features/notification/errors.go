@@ -15,3 +15,6 @@ var errorMap = []apperr.Mapping{
 }
 
 func mapErr(err error) error { return apperr.MapSentinels(err, errorMap) }
+
+// errAuditRecorded is returned by AuditWriter when an entry with the same audit_key exists.
+var errAuditRecorded = errors.New("notification: audit entry already recorded")

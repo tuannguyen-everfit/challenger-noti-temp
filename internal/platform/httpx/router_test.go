@@ -131,3 +131,47 @@ func TestNewRouter_Notifications_RequireBearer(t *testing.T) {
 		}
 	}
 }
+
+func TestNewRouter_Devices_RequireBearer(t *testing.T) {
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		w := httptest.NewRecorder()
+		newTestRouter(t).ServeHTTP(w, httptest.NewRequest(method, "/api/v1/devices/d-1", strings.NewReader(`{"platform":"ios","token":"t"}`)))
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s /api/v1/devices/d-1 status = %d, want 401", method, w.Code)
+		}
+	}
+}
+
+// countingIdempotencyCache records lookups so a test can prove the cache ran (or not).
+type countingIdempotencyCache struct{ gets int }
+
+func (c *countingIdempotencyCache) Get(context.Context, string) ([]byte, bool, error) {
+	c.gets++
+	return nil, false, nil
+}
+
+func (c *countingIdempotencyCache) Set(context.Context, string, []byte, time.Duration) error {
+	return nil
+}
+
+func TestNewRouter_IdempotencyRunsAfterBearer(t *testing.T) {
+	cache := &countingIdempotencyCache{}
+	router := NewRouter(RouterDeps{
+		Health:           health.New(stubPinger{}, stubPinger{}, health.Meta{}),
+		Notification:     notification.NewHandler(nil),
+		AccessVerifier:   rejectingVerifier{},
+		IdempotencyCache: cache,
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/devices/d-1", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer bad")
+	req.Header.Set("Idempotency-Key", "k1")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if cache.gets != 0 {
+		t.Errorf("idempotency cache consulted %d times before auth, want 0", cache.gets)
+	}
+}

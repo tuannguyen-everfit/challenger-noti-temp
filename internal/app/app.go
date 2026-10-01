@@ -71,6 +71,7 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	notificationSvc := notification.New(
 		notification.NewMongoRepository(mongoClient),
+		notification.NewMongoAuditWriter(mongoClient),
 		notification.Config{MaxListLimit: cfg.Pagination.MaxLimit},
 	)
 	notificationHandler := notification.NewHandler(notificationSvc)

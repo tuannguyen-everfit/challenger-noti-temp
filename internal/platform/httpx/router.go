@@ -68,9 +68,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 	//   3. Timeout    — bounds each request; downstream uses ctx-with-deadline
 	//   4. AccessLog  — captures the final status code
 	//
-	// Idempotency + Throttle are scoped to the versioned API group — neither
-	// belongs on health probes (idempotency replay would mask a real probe
-	// failure; throttle would kill kubelet visibility under load).
+	// Throttle is scoped to the versioned API group and Idempotency to its authed
+	// group — neither belongs on health probes (idempotency replay would mask a
+	// real probe failure; throttle would kill kubelet visibility under load).
 	r.Use(middleware.RequestID)
 	r.Use(middleware.ClientIP) // RFC 7239 + X-Forwarded-For → stamps client_ip on the request logger
 	r.Use(middleware.Recover)
@@ -107,16 +107,19 @@ func NewRouter(deps RouterDeps) http.Handler {
 	// their paths with `/api/v1/` themselves.
 	r.Route(apiVersionPrefix, func(r chi.Router) {
 		r.Use(middleware.Throttle(deps.ThrottleMax, deps.ThrottleBacklog, deps.ThrottleBacklogTimeout))
-		r.Use(middleware.Idempotency(deps.IdempotencyCache, idempotencyCacheTTL))
 
 		// Public feature mounts go here: r.Mount("/<feature>", deps.<Feature>.Routes()).
+		// They get no Idempotency: its replay key is scoped by the authenticated caller.
 
 		// Bearer-authed features — the middleware reads the JWT `sub` claim and
 		// stamps it on ctx (middleware.UserIDFromContext). A nil AccessVerifier
 		// fails closed (500) inside BearerAuth.
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.BearerAuth(deps.AccessVerifier))
+			// After BearerAuth: the replay cache key includes the caller.
+			r.Use(middleware.Idempotency(deps.IdempotencyCache, idempotencyCacheTTL))
 			r.Mount("/notifications", deps.Notification.Routes())
+			r.Mount("/devices", deps.Notification.DeviceRoutes())
 		})
 	})
 

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -11,6 +12,21 @@ import (
 // headerRequestID uses the BARE name per RFC 6648 (the `X-` prefix is
 // deprecated for new headers). See .claude/rules/http.md §6 + headers.md §3.
 const headerRequestID = "Request-Id"
+
+type requestIDKey struct{}
+
+// RequestIDFromContext returns the id minted by RequestID, or "" outside a request.
+func RequestIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(requestIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithRequestID stamps a request id on ctx; RequestID uses it, tests call it directly.
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey{}, id)
+}
 
 // RequestID mints a UUIDv4 for each request, echoes it in the response
 // header, and injects both the value and a child logger into the request
@@ -32,7 +48,7 @@ func RequestID(next http.Handler) http.Handler {
 		w.Header().Set(headerRequestID, rid)
 
 		log := logging.FromContext(r.Context()).With("request_id", rid)
-		ctx := logging.ContextWithLogger(r.Context(), log)
+		ctx := WithRequestID(logging.ContextWithLogger(r.Context(), log), rid)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

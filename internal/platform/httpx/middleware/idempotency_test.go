@@ -148,7 +148,7 @@ func TestIdempotency_InvalidKeyPassesThrough(t *testing.T) {
 		t.Errorf("invalid key should still execute, calls = %d", calls)
 	}
 	// Ensure nothing was cached.
-	if _, hit, _ := cache.Get(context.Background(), "idempotency:"+strings.Repeat("x", 200)); hit {
+	if _, hit, _ := cache.Get(context.Background(), "idempotency::POST /x:"+strings.Repeat("x", 200)); hit {
 		t.Error("invalid key should not be cached")
 	}
 }
@@ -192,4 +192,37 @@ func TestIdempotency_SkipCacheReachesHandlerEveryTime(t *testing.T) {
 
 	// Outside the middleware there is no flag to set — must be a no-op, not a panic.
 	SkipIdempotencyCache(context.Background())
+}
+
+func TestIdempotency_KeyScopedByUserMethodAndPath(t *testing.T) {
+	calls := 0
+	cache := newMemCache()
+	h := Idempotency(cache, time.Hour)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	send := func(user, method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(WithUserID(context.Background(), user), method, path, strings.NewReader("{}"))
+		req.Header.Set(HeaderIdempotencyKey, "shared-key")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	send("user-a", http.MethodPost, "/x")
+	if rec := send("user-b", http.MethodPost, "/x"); rec.Header().Get("Idempotency-Replayed") != "" {
+		t.Error("user-b replayed user-a's response")
+	}
+	send("user-a", http.MethodPut, "/x")
+	send("user-a", http.MethodPost, "/y")
+	if calls != 4 {
+		t.Errorf("calls = %d, want 4 (user, method and path each scope the key)", calls)
+	}
+	if rec := send("user-a", http.MethodPost, "/x"); rec.Header().Get("Idempotency-Replayed") != "true" {
+		t.Error("same user + method + path + key should replay")
+	}
+	if _, hit, _ := cache.Get(context.Background(), "idempotency:user-a:POST /x:shared-key"); !hit {
+		t.Error("cache key shape changed")
+	}
 }

@@ -67,3 +67,23 @@ func TestRequestID_UUIDsAreUnique(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+func TestRequestID_StampsContext(t *testing.T) {
+	var fromCtx string
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		fromCtx = RequestIDFromContext(r.Context())
+	})
+
+	rec := httptest.NewRecorder()
+	RequestID(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if fromCtx == "" || fromCtx != rec.Header().Get(headerRequestID) {
+		t.Errorf("ctx request id = %q, want the echoed header %q", fromCtx, rec.Header().Get(headerRequestID))
+	}
+}
+
+func TestRequestIDFromContext_Absent(t *testing.T) {
+	if got := RequestIDFromContext(httptest.NewRequest(http.MethodGet, "/x", nil).Context()); got != "" {
+		t.Errorf("RequestIDFromContext = %q, want empty", got)
+	}
+}

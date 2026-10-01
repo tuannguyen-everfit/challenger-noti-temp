@@ -50,7 +50,8 @@ type cachedResponse struct {
 }
 
 // Idempotency replays a previously seen response for the same Idempotency-Key
-// on POST/PUT/PATCH/DELETE. Safe methods (GET/HEAD) pass through.
+// on POST/PUT/PATCH/DELETE. Safe methods (GET/HEAD) pass through. Mount it
+// after BearerAuth: the cache key includes the authenticated user.
 //
 // Replay window defaults to 24h. Missing or empty header → no-op (pass through).
 //
@@ -79,7 +80,7 @@ func Idempotency(cache IdempotencyCache, ttl time.Duration) func(http.Handler) h
 				return
 			}
 
-			cacheKey := "idempotency:" + key
+			cacheKey := buildIdempotencyCacheKey(r, key)
 			if raw, hit, err := cache.Get(r.Context(), cacheKey); err == nil && hit {
 				var cr cachedResponse
 				if jErr := json.Unmarshal(raw, &cr); jErr == nil {
@@ -116,6 +117,12 @@ func Idempotency(cache IdempotencyCache, ttl time.Duration) func(http.Handler) h
 			}
 		})
 	}
+}
+
+// buildIdempotencyCacheKey scopes the client key by caller, method and path so a
+// reused key never replays another user's (or another endpoint's) response.
+func buildIdempotencyCacheKey(r *http.Request, key string) string {
+	return "idempotency:" + UserIDFromContext(r.Context()) + ":" + r.Method + " " + r.URL.Path + ":" + key
 }
 
 func isMutatingMethod(m string) bool {

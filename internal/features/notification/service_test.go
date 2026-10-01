@@ -1,18 +1,23 @@
 package notification
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"maps"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Everfit-io/go-service-template/internal/platform/apperr"
+	"github.com/Everfit-io/go-service-template/internal/platform/httpx/middleware"
 	"github.com/Everfit-io/go-service-template/internal/platform/localization"
 )
 
@@ -36,7 +41,9 @@ type rangeCall struct {
 
 type rangeBounds struct{ from, to time.Time }
 
-// mockRepo returns canned responses and records arguments; it never filters or sorts.
+// mockRepo returns canned feed / count responses and records their arguments; devices are an
+// in-memory table with the unique indexes enforced. WithTransaction restores devices and the
+// linked audit entries when fn fails, so rollback is observable.
 type mockRepo struct {
 	mu          sync.Mutex
 	feedPages   [][]Notification
@@ -46,7 +53,133 @@ type mockRepo struct {
 	rangeCounts map[rangeBounds]int64
 	rangeCalls  []rangeCall
 	err         error
+
+	devices   map[bson.ObjectID]Device
+	deviceErr map[string]error // method name → injected error
+	audit     *mockAuditWriter
 }
+
+type mockAuditWriter struct {
+	mu      sync.Mutex
+	entries []AuditLog
+	err     error
+}
+
+func (m *mockAuditWriter) Write(_ context.Context, e AuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return m.err
+	}
+	m.entries = append(m.entries, e)
+	return nil
+}
+
+func (m *mockAuditWriter) snapshot() []AuditLog {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]AuditLog(nil), m.entries...)
+}
+
+func (m *mockAuditWriter) restore(entries []AuditLog) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.entries = entries
+}
+
+func (m *mockRepo) WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	m.mu.Lock()
+	devices := maps.Clone(m.devices)
+	m.mu.Unlock()
+	entries := m.audit.snapshot()
+
+	if err := fn(ctx); err != nil {
+		m.mu.Lock()
+		m.devices = devices
+		m.mu.Unlock()
+		m.audit.restore(entries)
+		return err
+	}
+	return nil
+}
+
+func (m *mockRepo) FindDevice(_ context.Context, userID bson.ObjectID, deviceID string) (Device, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deviceErr["FindDevice"]; err != nil {
+		return Device{}, false, err
+	}
+	for _, d := range m.devices {
+		if d.UserID == userID && d.DeviceID == deviceID {
+			return d, true, nil
+		}
+	}
+	return Device{}, false, nil
+}
+
+func (m *mockRepo) FindDeviceByToken(_ context.Context, token string) (Device, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deviceErr["FindDeviceByToken"]; err != nil {
+		return Device{}, false, err
+	}
+	for _, d := range m.devices {
+		if d.Token == token {
+			return d, true, nil
+		}
+	}
+	return Device{}, false, nil
+}
+
+func (m *mockRepo) UpsertDevice(_ context.Context, d Device) (bson.ObjectID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deviceErr["UpsertDevice"]; err != nil {
+		return bson.ObjectID{}, err
+	}
+	var current *Device
+	for id, row := range m.devices {
+		switch {
+		case row.UserID == d.UserID && row.DeviceID == d.DeviceID:
+			current, d.ID = &row, id
+		case row.Token == d.Token:
+			return bson.ObjectID{}, errDuplicateToken
+		}
+	}
+	if current == nil {
+		d.ID = bson.NewObjectID()
+	} else {
+		d.CreatedAt, d.CreatedBy = current.CreatedAt, current.CreatedBy
+	}
+	m.devices[d.ID] = d
+	return d.ID, nil
+}
+
+func (m *mockRepo) TouchDevice(_ context.Context, id bson.ObjectID, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deviceErr["TouchDevice"]; err != nil {
+		return err
+	}
+	d := m.devices[id]
+	d.LastRegisteredAt = at
+	m.devices[id] = d
+	return nil
+}
+
+func (m *mockRepo) DeleteDevice(_ context.Context, id bson.ObjectID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deviceErr["DeleteDevice"]; err != nil {
+		return false, err
+	}
+	_, ok := m.devices[id]
+	delete(m.devices, id)
+	return ok, nil
+}
+
+// errDuplicateToken is what the unique `devices_token` index would raise.
+var errDuplicateToken = errors.New("mock: duplicate token")
 
 func (m *mockRepo) ListFeed(_ context.Context, userID bson.ObjectID, tab Tab, after feedCursor, limit int) ([]Notification, error) {
 	m.mu.Lock()
@@ -84,10 +217,18 @@ func (m *mockRepo) CountRange(_ context.Context, userID bson.ObjectID, tab Tab, 
 }
 
 func newSvc(now time.Time) (*Service, *mockRepo) {
-	repo := &mockRepo{}
-	svc := New(repo, Config{MaxListLimit: 100})
+	repo := &mockRepo{devices: map[bson.ObjectID]Device{}, audit: &mockAuditWriter{}}
+	svc := New(repo, repo.audit, Config{MaxListLimit: 100})
 	svc.now = frozenTime(now)
 	return svc, repo
+}
+
+// seedDevice stores d as an existing row and returns it with its _id.
+func seedDevice(t *testing.T, repo *mockRepo, d Device) Device {
+	t.Helper()
+	d.ID = bson.NewObjectID()
+	repo.devices[d.ID] = d
+	return d
 }
 
 func frozenTime(t time.Time) func() time.Time { return func() time.Time { return t } }
@@ -441,6 +582,347 @@ func assertRanges(t *testing.T, calls []rangeCall, user bson.ObjectID, tab Tab, 
 	for _, w := range want {
 		if !got[rangeBounds{from: w.from.UTC(), to: w.to.UTC()}] {
 			t.Errorf("missing range [%v, %v); got %+v", w.from, w.to, calls)
+		}
+	}
+}
+
+var deviceNow = time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+
+func userActor(id bson.ObjectID) Actor {
+	return Actor{Type: ActorTypeUser, ID: id.Hex(), Via: actorViaAPI}
+}
+
+func findDeviceRow(t *testing.T, repo *mockRepo, userID bson.ObjectID, deviceID string) Device {
+	t.Helper()
+	d, ok, err := repo.FindDevice(context.Background(), userID, deviceID)
+	if err != nil || !ok {
+		t.Fatalf("device (%s, %s) not stored: ok=%v err=%v", userID.Hex(), deviceID, ok, err)
+	}
+	return d
+}
+
+func TestRegisterDevice_CreatesRowAndAudit(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	traceID := trace.TraceID{1, 2, 3}
+	ctx := trace.ContextWithSpanContext(middleware.WithRequestID(context.Background(), "req-1"),
+		trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: trace.SpanID{4}}))
+
+	got, err := svc.RegisterDevice(ctx, RegisterDeviceInput{UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "tok-1", AppVersion: "1.0"})
+	if err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	row := findDeviceRow(t, repo, user, "d-1")
+	if got.ID != row.ID || row.Token != "tok-1" || row.Platform != PlatformIOS || row.AppVersion != "1.0" {
+		t.Errorf("row = %+v, returned %+v", row, got)
+	}
+	actor := userActor(user)
+	if !row.CreatedAt.Equal(deviceNow) || !row.UpdatedAt.Equal(deviceNow) || !row.LastRegisteredAt.Equal(deviceNow) {
+		t.Errorf("timestamps = created %v updated %v registered %v, want %v", row.CreatedAt, row.UpdatedAt, row.LastRegisteredAt, deviceNow)
+	}
+	if row.CreatedBy != actor || row.UpdatedBy == nil || *row.UpdatedBy != actor {
+		t.Errorf("created_by / updated_by = %+v / %+v, want %+v", row.CreatedBy, row.UpdatedBy, actor)
+	}
+
+	entries := repo.audit.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Entity != AuditEntityDevice || e.EntityID != row.ID.Hex() || e.Action != AuditActionCreate || e.Actor != actor {
+		t.Errorf("entry = %+v", e)
+	}
+	if e.UserID == nil || *e.UserID != user || !e.At.Equal(deviceNow) || len(e.Changes) != 0 {
+		t.Errorf("entry user / at / changes = %v / %v / %v", e.UserID, e.At, e.Changes)
+	}
+	if e.RequestID != "req-1" || e.TraceID != traceID.String() {
+		t.Errorf("request_id / trace_id = %q / %q", e.RequestID, e.TraceID)
+	}
+}
+
+func TestRegisterDevice_NewTokenUpdatesSameRow(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	created := deviceNow.Add(-48 * time.Hour)
+	seeded := seedDevice(t, repo, Device{
+		UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "old-token", AppVersion: "1.0",
+		CreatedAt: created, CreatedBy: userActor(user), UpdatedAt: created, LastRegisteredAt: created,
+	})
+
+	if _, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "new-token", AppVersion: "1.1"}); err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	if len(repo.devices) != 1 {
+		t.Fatalf("rows = %d, want 1 (no duplicate)", len(repo.devices))
+	}
+	row := findDeviceRow(t, repo, user, "d-1")
+	if row.ID != seeded.ID || row.Token != "new-token" || row.AppVersion != "1.1" {
+		t.Errorf("row = %+v", row)
+	}
+	if !row.CreatedAt.Equal(created) || !row.UpdatedAt.Equal(deviceNow) {
+		t.Errorf("created_at / updated_at = %v / %v", row.CreatedAt, row.UpdatedAt)
+	}
+
+	entries := repo.audit.snapshot()
+	if len(entries) != 1 || entries[0].Action != AuditActionUpdate || entries[0].EntityID != seeded.ID.Hex() {
+		t.Fatalf("entries = %+v, want one update", entries)
+	}
+	want := map[string]FieldChange{
+		"app_version": {From: "1.0", To: "1.1"},
+		"token":       {Changed: true},
+	}
+	if !reflect.DeepEqual(entries[0].Changes, want) {
+		t.Errorf("changes = %+v, want %+v", entries[0].Changes, want)
+	}
+	assertNoTokenInAudit(t, entries, "old-token", "new-token")
+}
+
+func TestRegisterDevice_PlatformChangeRecorded(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	seedDevice(t, repo, Device{UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "tok"})
+
+	if _, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: user, DeviceID: "d-1", Platform: PlatformAndroid, Token: "tok"}); err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	entries := repo.audit.snapshot()
+	want := map[string]FieldChange{"platform": {From: PlatformIOS, To: PlatformAndroid}}
+	if len(entries) != 1 || !reflect.DeepEqual(entries[0].Changes, want) {
+		t.Errorf("entries = %+v, want one update with %+v", entries, want)
+	}
+}
+
+func TestRegisterDevice_IdenticalPutOnlyTouches(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	earlier := deviceNow.Add(-time.Hour)
+	seedDevice(t, repo, Device{
+		UserID: user, DeviceID: "d-1", Platform: PlatformAndroid, Token: "tok", AppVersion: "2.0",
+		UpdatedAt: earlier, LastRegisteredAt: earlier,
+	})
+
+	got, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: user, DeviceID: "d-1", Platform: PlatformAndroid, Token: "tok", AppVersion: "2.0"})
+	if err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	row := findDeviceRow(t, repo, user, "d-1")
+	if !row.LastRegisteredAt.Equal(deviceNow) || !row.UpdatedAt.Equal(earlier) {
+		t.Errorf("last_registered_at / updated_at = %v / %v, want %v / %v", row.LastRegisteredAt, row.UpdatedAt, deviceNow, earlier)
+	}
+	if !got.UpdatedAt.Equal(earlier) || !got.LastRegisteredAt.Equal(deviceNow) {
+		t.Errorf("returned updated_at / last_registered_at = %v / %v", got.UpdatedAt, got.LastRegisteredAt)
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0 for a refresh-only PUT", n)
+	}
+}
+
+func TestRegisterDevice_TokenHeldByAnotherAccountIsEvicted(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	caller, previous := bson.NewObjectID(), bson.NewObjectID()
+	old := seedDevice(t, repo, Device{UserID: previous, DeviceID: "shared-phone", Platform: PlatformIOS, Token: "tok"})
+
+	if _, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: caller, DeviceID: "shared-phone", Platform: PlatformIOS, Token: "tok"}); err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	if _, ok := repo.devices[old.ID]; ok {
+		t.Error("previous account's row still holds the token")
+	}
+	row := findDeviceRow(t, repo, caller, "shared-phone")
+
+	entries := repo.audit.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2 (delete + create)", len(entries))
+	}
+	del, create := entries[0], entries[1]
+	if del.Action != AuditActionDelete || del.EntityID != old.ID.Hex() || del.UserID == nil || *del.UserID != previous || del.Actor != userActor(caller) {
+		t.Errorf("eviction entry = %+v", del)
+	}
+	if create.Action != AuditActionCreate || create.EntityID != row.ID.Hex() {
+		t.Errorf("create entry = %+v", create)
+	}
+	assertNoTokenInAudit(t, entries, "tok")
+}
+
+func TestRegisterDevice_TokenMovedFromCallersOtherDevice(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	other := seedDevice(t, repo, Device{UserID: user, DeviceID: "old-install", Platform: PlatformIOS, Token: "tok"})
+
+	if _, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: user, DeviceID: "new-install", Platform: PlatformIOS, Token: "tok"}); err != nil {
+		t.Fatalf("RegisterDevice: %v", err)
+	}
+
+	if _, ok := repo.devices[other.ID]; ok || len(repo.devices) != 1 {
+		t.Errorf("rows = %+v, want only new-install", repo.devices)
+	}
+}
+
+func TestRegisterDevice_AuditFailureRollsBack(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	caller, previous := bson.NewObjectID(), bson.NewObjectID()
+	old := seedDevice(t, repo, Device{UserID: previous, DeviceID: "phone", Platform: PlatformIOS, Token: "tok"})
+	repo.audit.err = errors.New("audit down")
+
+	_, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{UserID: caller, DeviceID: "phone", Platform: PlatformIOS, Token: "tok"})
+	if !errors.Is(err, repo.audit.err) {
+		t.Fatalf("err = %v, want the audit error", err)
+	}
+	if _, ok := repo.devices[old.ID]; !ok || len(repo.devices) != 1 {
+		t.Errorf("rows = %+v, want the untouched original only", repo.devices)
+	}
+}
+
+func TestRegisterDevice_RepoErrorPropagates(t *testing.T) {
+	for _, method := range []string{"FindDevice", "FindDeviceByToken", "DeleteDevice", "UpsertDevice", "TouchDevice"} {
+		t.Run(method, func(t *testing.T) {
+			svc, repo := newSvc(deviceNow)
+			user := bson.NewObjectID()
+			seedDevice(t, repo, Device{UserID: bson.NewObjectID(), DeviceID: "other", Token: "held"})
+			seedDevice(t, repo, Device{UserID: user, DeviceID: "same", Platform: PlatformIOS, Token: "same-tok"})
+			boom := errors.New("mongo down")
+			repo.deviceErr = map[string]error{method: boom}
+
+			in := RegisterDeviceInput{UserID: user, DeviceID: "new", Platform: PlatformIOS, Token: "held"}
+			if method == "TouchDevice" {
+				in = RegisterDeviceInput{UserID: user, DeviceID: "same", Platform: PlatformIOS, Token: "same-tok"}
+			}
+			if _, err := svc.RegisterDevice(context.Background(), in); !errors.Is(err, boom) {
+				t.Errorf("err = %v, want %v", err, boom)
+			}
+			if n := len(repo.audit.snapshot()); n != 0 {
+				t.Errorf("audit entries = %d, want 0", n)
+			}
+		})
+	}
+}
+
+func TestRemoveDevice_DeletesAndAudits(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	row := seedDevice(t, repo, Device{UserID: user, DeviceID: "d-1", Platform: PlatformIOS, Token: "tok"})
+
+	removed, err := svc.RemoveDevice(context.Background(), RemoveDeviceInput{UserID: user, DeviceID: "d-1"})
+	if err != nil || !removed {
+		t.Fatalf("RemoveDevice = %v, %v; want true, nil", removed, err)
+	}
+	if len(repo.devices) != 0 {
+		t.Errorf("rows = %d, want 0", len(repo.devices))
+	}
+	entries := repo.audit.snapshot()
+	if len(entries) != 1 || entries[0].Action != AuditActionDelete || entries[0].EntityID != row.ID.Hex() || entries[0].Actor != userActor(user) {
+		t.Errorf("entries = %+v, want one delete", entries)
+	}
+	assertNoTokenInAudit(t, entries, "tok")
+}
+
+func TestRemoveDevice_UnknownDeviceIsNoOp(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	owner := bson.NewObjectID()
+	seedDevice(t, repo, Device{UserID: owner, DeviceID: "d-1", Token: "tok"})
+
+	removed, err := svc.RemoveDevice(context.Background(), RemoveDeviceInput{UserID: bson.NewObjectID(), DeviceID: "d-1"})
+	if err != nil || removed {
+		t.Fatalf("RemoveDevice = %v, %v; want false, nil", removed, err)
+	}
+	if len(repo.devices) != 1 {
+		t.Error("another user's device was removed")
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0", n)
+	}
+}
+
+func TestRemoveDevice_AuditFailureRollsBack(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	user := bson.NewObjectID()
+	seedDevice(t, repo, Device{UserID: user, DeviceID: "d-1", Token: "tok"})
+	repo.audit.err = errors.New("audit down")
+
+	if _, err := svc.RemoveDevice(context.Background(), RemoveDeviceInput{UserID: user, DeviceID: "d-1"}); !errors.Is(err, repo.audit.err) {
+		t.Fatalf("err = %v, want the audit error", err)
+	}
+	if len(repo.devices) != 1 {
+		t.Error("device deleted although its audit entry failed")
+	}
+}
+
+func TestRemoveDevice_RepoErrorPropagates(t *testing.T) {
+	for _, method := range []string{"FindDevice", "DeleteDevice"} {
+		t.Run(method, func(t *testing.T) {
+			svc, repo := newSvc(deviceNow)
+			user := bson.NewObjectID()
+			seedDevice(t, repo, Device{UserID: user, DeviceID: "d-1", Token: "tok"})
+			boom := errors.New("mongo down")
+			repo.deviceErr = map[string]error{method: boom}
+
+			if _, err := svc.RemoveDevice(context.Background(), RemoveDeviceInput{UserID: user, DeviceID: "d-1"}); !errors.Is(err, boom) {
+				t.Errorf("err = %v, want %v", err, boom)
+			}
+		})
+	}
+}
+
+func TestPickAuditChanges(t *testing.T) {
+	got := pickAuditChanges(AuditEntityDevice, map[string]FieldChange{
+		"platform":    {From: PlatformIOS, To: PlatformAndroid},
+		"token":       {From: "secret-a", To: "secret-b"},
+		"device_name": {From: "Pixel 8", To: "x"},
+	})
+	want := map[string]FieldChange{
+		"platform": {From: PlatformIOS, To: PlatformAndroid},
+		"token":    {Changed: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("pickAuditChanges = %+v, want %+v", got, want)
+	}
+	if got := pickAuditChanges("unknown", map[string]FieldChange{"platform": {To: "x"}}); len(got) != 0 {
+		t.Errorf("unknown entity kept %+v", got)
+	}
+}
+
+func TestRecordAudit_SkipsNoOpUpdate(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	err := svc.recordAudit(context.Background(), AuditLog{
+		Entity: AuditEntityDevice, Action: AuditActionUpdate,
+		Changes: map[string]FieldChange{"not_allowed": {To: 1}},
+	})
+	if err != nil {
+		t.Fatalf("recordAudit: %v", err)
+	}
+	if n := len(repo.audit.snapshot()); n != 0 {
+		t.Errorf("audit entries = %d, want 0 for an update with no allow-listed change", n)
+	}
+}
+
+func TestRunAudited_DuplicateAuditKeyIsSuccess(t *testing.T) {
+	svc, repo := newSvc(deviceNow)
+	repo.audit.err = errAuditRecorded
+	err := svc.runAudited(context.Background(), func(ctx context.Context) error {
+		return svc.recordAudit(ctx, AuditLog{Entity: AuditEntityDevice, Action: AuditActionCreate, AuditKey: "event:1"})
+	})
+	if err != nil {
+		t.Errorf("runAudited = %v, want nil (already recorded)", err)
+	}
+}
+
+// assertNoTokenInAudit fails if a token value reaches any stored entry.
+func assertNoTokenInAudit(t *testing.T, entries []AuditLog, tokens ...string) {
+	t.Helper()
+	for _, e := range entries {
+		raw, err := bson.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshal entry: %v", err)
+		}
+		for _, tok := range tokens {
+			if bytes.Contains(raw, []byte(tok)) {
+				t.Errorf("token %q leaked into audit entry %+v", tok, e)
+			}
 		}
 	}
 }
