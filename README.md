@@ -98,8 +98,9 @@ All variables use the `SVC_` prefix. For local development copy
 | `SVC_VALKEY_DB`          | `0`          | no       |
 | `SVC_KAFKA_BROKERS`      | (empty)      | no — empty disables Kafka producer + all consumers |
 | `SVC_SHUTDOWN_TIMEOUT`   | `15s`        | no       |
-| `SVC_AUTH_JWT_ACCESS_SECRET` / `SVC_AUTH_JWT_REFRESH_SECRET` | — | yes — boot fails without both (every route is Bearer-authed) |
+| `SVC_AUTH_JWT_ACCESS_SECRET` / `SVC_AUTH_JWT_REFRESH_SECRET` | — | yes — boot fails without both (every public route is Bearer-authed) |
 | `SVC_PAGINATION_MAX_LIMIT` | `100` | no |
+| `SVC_NOTIFICATION_INTERNAL_API_SECRET` | (empty) | no — empty leaves the account-deletion purge route unmounted; when set, ≥ 32 bytes |
 
 `MONGO_URI` must contain `replicaSet=` — enforced at startup to guarantee dev/prod parity for transactions.
 

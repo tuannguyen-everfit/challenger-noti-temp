@@ -58,3 +58,18 @@ The service tests run against `mockRepo`: an in-memory device table that enforce
 | Replay key scoped by user + method + path | `middleware/idempotency_test.go::TestIdempotency_KeyScopedByUserMethodAndPath` |
 | `request_id` reachable from ctx | `middleware/requestid_test.go::TestRequestID_StampsContext`, `TestRequestIDFromContext_Absent` |
 | Transaction helper runs fn with a session ctx and returns fn's error | `internal/infra/mongox/client_test.go::TestWithTransaction_RunsFnWithSessionContext`, `TestWithTransaction_ReturnsFnError` (offline client) |
+
+## CHAL-402 — internal purge
+
+| AC / requirement | Test |
+|---|---|
+| 12 notifications + 2 devices → `{12, 2}`; one `purge` entry (entity `user`, count 14, actor `service/<caller>/internal_api`); earlier entries kept; other user untouched | `service_test.go::TestPurgeUser_DeletesBothAndAudits` |
+| Second call → `{0, 0}`, no second entry | `TestPurgeUser_SecondCallIsNoOp` |
+| Audit failure → nothing deleted | `TestPurgeUser_AuditFailureDeletesNothing` |
+| Repo errors propagate and roll back | `TestPurgeUser_RepoErrorPropagates` |
+| A purge that deleted nothing writes no entry | `TestRecordAudit_SkipsEmptyPurge` |
+| `user_id` + `everfit-source` passed through; zero counts on the wire | `handler_test.go::TestPurgeUser_PassesUserAndCaller`, `TestPurgeUser_CallerOptional` |
+| Non-hex / short / zero `user_id`, caller > 64 → 400, service not called | `TestPurgeUser_InvalidRequest` |
+| Service error → 500 without leaking | `TestPurgeUser_ServiceError` |
+| Secret unset → 404; missing / wrong secret → 401; right secret reaches the handler without Bearer | `router_test.go::TestNewRouter_InternalPurge_NotMountedWithoutSecret`, `TestNewRouter_InternalPurge_RequiresSecretNotBearer` |
+| Secret from env; empty by default; < 32 bytes fails boot | `config_test.go::TestLoad_Notification_InternalSecret`, `TestValidate_Guards` |

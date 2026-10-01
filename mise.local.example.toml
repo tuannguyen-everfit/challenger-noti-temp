@@ -53,6 +53,10 @@ SVC_VALKEY_DB          = "0"
 # a mismatch silently subscribes to a topic no producer writes to. Default "dev".
 # SVC_KAFKA_TOPIC_PREFIX = "dev"
 
+# Internal-Secret for DELETE /api/v1/internal/notifications/users/{user_id}
+# (account-deletion purge). Empty = route not mounted; when set, ≥ 32 bytes.
+# SVC_NOTIFICATION_INTERNAL_API_SECRET = "local-internal-secret-dev-only-0123456789"
+
 # Global per-request HTTP timeout. Override per-route via r.With(middleware.Timeout).
 SVC_HTTP_TIMEOUT       = "30s"
 
