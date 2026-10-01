@@ -1,0 +1,37 @@
+// Server-to-server read API that challenger-service exposes to
+// challenger-notification-service. challenger-service owns this contract; the
+// notification service mirrors the file byte-for-byte. A breaking change is a
+// new v2 package, never an in-place edit (buf breaking guards this in CI).
+syntax = "proto3";
+
+package challenger.internal.v1;
+
+option go_package = "github.com/Everfit-io/challenger-service/proto/challenger/internalv1;internalv1";
+
+// WhitelistInternalService serves the private-challenge audience.
+// Every RPC requires the internal-api-secret metadata.
+service WhitelistInternalService {
+  // ListWhitelistEmails pages a challenge's whitelist members: every row not
+  // removed (is_removed != true), IGNORING is_active — the CMS clears is_active
+  // at go-live, so an active-only filter would return nothing when a private
+  // challenge's "published" notification fires. Emails come back trimmed and
+  // lower-cased, each at most once. A page can hold fewer than page_size
+  // emails while next_page_token is set; page on the token.
+  rpc ListWhitelistEmails(ListWhitelistEmailsRequest) returns (ListWhitelistEmailsResponse);
+}
+
+// ListWhitelistEmailsRequest pages one challenge's whitelist.
+message ListWhitelistEmailsRequest {
+  string challenge_id = 1;
+  // 0 means 1000; larger values are capped at 1000; negative is rejected.
+  int32 page_size = 2;
+  // Opaque; empty starts from the beginning.
+  string page_token = 3;
+}
+
+// ListWhitelistEmailsResponse is one page of member emails.
+message ListWhitelistEmailsResponse {
+  repeated string emails = 1;
+  // Empty when there are no more rows.
+  string next_page_token = 2;
+}

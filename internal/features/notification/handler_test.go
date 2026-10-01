@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -29,7 +30,27 @@ type mockNotificationService struct {
 	removeRes   bool
 	purgeIn     []PurgeUserInput
 	purgeRes    PurgeUserResult
+	readIn      []MarkReadInput
+	readRes     MarkReadResult
+	readAllIn   []MarkAllReadInput
+	readAllRes  int64
 	err         error
+}
+
+func (m *mockNotificationService) MarkRead(_ context.Context, in MarkReadInput) (MarkReadResult, error) {
+	m.readIn = append(m.readIn, in)
+	if m.err != nil {
+		return MarkReadResult{}, m.err
+	}
+	return m.readRes, nil
+}
+
+func (m *mockNotificationService) MarkAllRead(_ context.Context, in MarkAllReadInput) (int64, error) {
+	m.readAllIn = append(m.readAllIn, in)
+	if m.err != nil {
+		return 0, m.err
+	}
+	return m.readAllRes, nil
 }
 
 func (m *mockNotificationService) PurgeUser(_ context.Context, in PurgeUserInput) (PurgeUserResult, error) {
@@ -536,4 +557,138 @@ func TestPurgeUser_ServiceError(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "mongo") {
 		t.Errorf("internal error leaked: %s", rec.Body.String())
 	}
+}
+
+// servePost drives a POST through Routes() with userID stamped as the JWT sub ("" = none).
+func servePost(t *testing.T, svc *mockNotificationService, userID, target, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader = http.NoBody
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req := httptest.NewRequestWithContext(middleware.WithUserID(context.Background(), userID), http.MethodPost, target, reader)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(svc).Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestMarkRead_MapsResponse(t *testing.T) {
+	user, id := bson.NewObjectID(), bson.NewObjectID()
+	now := time.Now()
+	svc := &mockNotificationService{readRes: MarkReadResult{
+		Notification: Notification{ID: id, ReadAt: &now, ButtonsHiddenAt: &now, Buttons: []Button{ButtonJumpIn, ButtonNah}},
+		Navigate:     Navigate{Type: NavigateChallengeDetail, ChallengeID: "c1"},
+		Available:    true,
+	}}
+
+	rec := servePost(t, svc, user.Hex(), "/"+id.Hex()+"/read", `{"action":"jump_in"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if want := (MarkReadInput{UserID: user, ID: id, Action: ReadActionJumpIn}); len(svc.readIn) != 1 || svc.readIn[0] != want {
+		t.Fatalf("svc input = %+v, want %+v", svc.readIn, want)
+	}
+	body := decodeBody(t, rec)
+	if body["id"] != id.Hex() || body["is_read"] != true || body["available"] != true {
+		t.Errorf("body = %v", body)
+	}
+	if buttons, ok := body["buttons"].([]any); !ok || len(buttons) != 0 {
+		t.Errorf("buttons = %v, want []", body["buttons"])
+	}
+	if nav, _ := body["navigate"].(map[string]any); nav["type"] != "challenge_detail" || nav["challenge_id"] != "c1" {
+		t.Errorf("navigate = %v", body["navigate"])
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Errorf("Cache-Control = %q", got)
+	}
+}
+
+func TestMarkRead_UnavailableNavigate(t *testing.T) {
+	id := bson.NewObjectID()
+	now := time.Now()
+	svc := &mockNotificationService{readRes: MarkReadResult{
+		Notification: Notification{ID: id, ReadAt: &now},
+		Navigate:     Navigate{Type: NavigateNone},
+	}}
+	body := decodeBody(t, servePost(t, svc, bson.NewObjectID().Hex(), "/"+id.Hex()+"/read", `{"action":"tap"}`))
+	nav, _ := body["navigate"].(map[string]any)
+	if body["available"] != false || nav["type"] != "none" {
+		t.Errorf("body = %v", body)
+	}
+	if _, ok := nav["challenge_id"]; ok {
+		t.Errorf("challenge_id on a none navigate: %v", nav)
+	}
+}
+
+func TestMarkRead_InvalidRequest(t *testing.T) {
+	id := bson.NewObjectID().Hex()
+	cases := map[string]struct{ target, body string }{
+		"read_all is not a tap action": {"/" + id + "/read", `{"action":"read_all"}`},
+		"unknown action":               {"/" + id + "/read", `{"action":"swipe"}`},
+		"missing action":               {"/" + id + "/read", `{}`},
+		"no body":                      {"/" + id + "/read", ""},
+		"malformed id":                 {"/not-an-id/read", `{"action":"tap"}`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc := &mockNotificationService{}
+			rec := servePost(t, svc, bson.NewObjectID().Hex(), tc.target, tc.body)
+			assertError(t, rec, http.StatusBadRequest, "INVALID_REQUEST")
+			if len(svc.readIn) != 0 {
+				t.Error("svc called on an invalid request")
+			}
+		})
+	}
+}
+
+func TestMarkRead_NotFound(t *testing.T) {
+	svc := &mockNotificationService{err: fmt.Errorf("mark read: %w", ErrNotFound)}
+	rec := servePost(t, svc, bson.NewObjectID().Hex(), "/"+bson.NewObjectID().Hex()+"/read", `{"action":"tap"}`)
+	assertError(t, rec, http.StatusNotFound, "NOTIFICATION_NOT_FOUND")
+}
+
+func TestMarkRead_ChallengerUnavailableIs503(t *testing.T) {
+	svc := &mockNotificationService{err: fmt.Errorf("mark read: %w", ErrChallengerUnavailable)}
+	rec := servePost(t, svc, bson.NewObjectID().Hex(), "/"+bson.NewObjectID().Hex()+"/read", `{"action":"tap"}`)
+	assertError(t, rec, http.StatusServiceUnavailable, "NOTIFICATION_CHALLENGER_UNAVAILABLE")
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("503 without Retry-After")
+	}
+}
+
+func TestMarkRead_NoUser(t *testing.T) {
+	svc := &mockNotificationService{}
+	rec := servePost(t, svc, "", "/"+bson.NewObjectID().Hex()+"/read", `{"action":"tap"}`)
+	assertError(t, rec, http.StatusUnauthorized, "UNAUTHORIZED")
+	if len(svc.readIn) != 0 {
+		t.Error("svc called without a caller")
+	}
+}
+
+func TestMarkAllRead_ReportsUpdated(t *testing.T) {
+	user := bson.NewObjectID()
+	svc := &mockNotificationService{readAllRes: 7}
+	for _, body := range []string{"", "{}"} {
+		rec := servePost(t, svc, user.Hex(), "/read-all", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("body %q: status = %d, %s", body, rec.Code, rec.Body.String())
+		}
+		if got := decodeBody(t, rec)["updated"]; got != float64(7) {
+			t.Errorf("updated = %v, want 7", got)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+			t.Errorf("Cache-Control = %q", got)
+		}
+	}
+	if len(svc.readAllIn) != 2 || svc.readAllIn[0] != (MarkAllReadInput{UserID: user}) {
+		t.Errorf("svc input = %+v", svc.readAllIn)
+	}
+}
+
+func TestMarkAllRead_NoUserAndServiceError(t *testing.T) {
+	assertError(t, servePost(t, &mockNotificationService{}, "", "/read-all", ""), http.StatusUnauthorized, "UNAUTHORIZED")
+	rec := servePost(t, &mockNotificationService{err: errors.New("mongo down")}, bson.NewObjectID().Hex(), "/read-all", "")
+	assertError(t, rec, http.StatusInternalServerError, "INTERNAL_ERROR")
 }

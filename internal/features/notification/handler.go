@@ -20,6 +20,8 @@ type notificationService interface {
 	RegisterDevice(ctx context.Context, in RegisterDeviceInput) (Device, error)
 	RemoveDevice(ctx context.Context, in RemoveDeviceInput) (bool, error)
 	PurgeUser(ctx context.Context, in PurgeUserInput) (PurgeUserResult, error)
+	MarkRead(ctx context.Context, in MarkReadInput) (MarkReadResult, error)
+	MarkAllRead(ctx context.Context, in MarkAllReadInput) (int64, error)
 }
 
 // Handler serves the notification HTTP endpoints.
@@ -33,6 +35,8 @@ func (h *Handler) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", typed.JSON(http.StatusOK, h.List))
 	r.Get("/summary", typed.JSON(http.StatusOK, h.Summary))
+	r.Post("/read-all", typed.JSON(http.StatusOK, h.MarkAllRead))
+	r.Post("/{id}/read", typed.JSON(http.StatusOK, h.MarkRead))
 	return r
 }
 
@@ -60,6 +64,29 @@ type ListRequest struct {
 type SummaryRequest struct {
 	Tab string `query:"tab" validate:"omitempty,oneof=all activities system"`
 	TZ  string `query:"tz"  validate:"omitempty,max=64"`
+}
+
+// MarkReadRequest is POST /notifications/{id}/read; read_all belongs to read-all only.
+type MarkReadRequest struct {
+	ID     string `path:"id"      validate:"required,len=24,hexadecimal"`
+	Action string `json:"action" validate:"required,oneof=tap jump_in nah"`
+}
+
+// MarkAllReadRequest is POST /notifications/read-all; it takes no fields.
+type MarkAllReadRequest struct{}
+
+// MarkReadResponse is the card after the read plus where the tap goes now.
+type MarkReadResponse struct {
+	ID        string           `json:"id"`
+	IsRead    bool             `json:"is_read"`
+	Buttons   []string         `json:"buttons"`
+	Navigate  NavigateResponse `json:"navigate"`
+	Available bool             `json:"available"` // false → show the "no longer available" toast (AC 0.12)
+}
+
+// MarkAllReadResponse is how many unread notifications were marked read.
+type MarkAllReadResponse struct {
+	Updated int64 `json:"updated"`
 }
 
 // RegisterDeviceRequest is PUT /devices/{device_id}.
@@ -160,6 +187,12 @@ func (FeedResponse) ResponseHeaders() http.Header { return buildPrivateNoStore()
 // ResponseHeaders keeps the personalised summary out of shared caches.
 func (SummaryResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
 
+// ResponseHeaders keeps the caller's card out of shared caches.
+func (MarkReadResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
+
+// ResponseHeaders keeps the caller's result out of shared caches.
+func (MarkAllReadResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
+
 // ResponseHeaders keeps the caller's device out of shared caches.
 func (DeviceResponse) ResponseHeaders() http.Header { return buildPrivateNoStore() }
 
@@ -198,6 +231,43 @@ func (h *Handler) Summary(ctx context.Context, req SummaryRequest) (SummaryRespo
 		return SummaryResponse{}, mapErr(err)
 	}
 	return toSummaryResponse(res), nil
+}
+
+// MarkRead handles POST /notifications/{id}/read.
+func (h *Handler) MarkRead(ctx context.Context, req MarkReadRequest) (MarkReadResponse, error) {
+	userID, err := parseCallerID(ctx)
+	if err != nil {
+		return MarkReadResponse{}, err
+	}
+	id, err := bson.ObjectIDFromHex(req.ID)
+	if err != nil {
+		return MarkReadResponse{}, apperr.BadRequest(localization.CodeInvalidRequest, "id must be an ObjectID").Wrap(err)
+	}
+	res, err := h.svc.MarkRead(ctx, MarkReadInput{UserID: userID, ID: id, Action: ReadAction(req.Action)})
+	if err != nil {
+		return MarkReadResponse{}, mapErr(err)
+	}
+	card := toItemResponse(res.Notification)
+	return MarkReadResponse{
+		ID:        card.ID,
+		IsRead:    card.IsRead,
+		Buttons:   card.Buttons,
+		Navigate:  NavigateResponse{Type: string(res.Navigate.Type), ChallengeID: res.Navigate.ChallengeID},
+		Available: res.Available,
+	}, nil
+}
+
+// MarkAllRead handles POST /notifications/read-all.
+func (h *Handler) MarkAllRead(ctx context.Context, _ MarkAllReadRequest) (MarkAllReadResponse, error) {
+	userID, err := parseCallerID(ctx)
+	if err != nil {
+		return MarkAllReadResponse{}, err
+	}
+	updated, err := h.svc.MarkAllRead(ctx, MarkAllReadInput{UserID: userID})
+	if err != nil {
+		return MarkAllReadResponse{}, mapErr(err)
+	}
+	return MarkAllReadResponse{Updated: updated}, nil
 }
 
 // RegisterDevice handles PUT /devices/{device_id}.

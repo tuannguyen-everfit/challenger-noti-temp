@@ -53,6 +53,14 @@ SVC_VALKEY_DB          = "0"
 # a mismatch silently subscribes to a topic no producer writes to. Default "dev".
 # SVC_KAFKA_TOPIC_PREFIX = "dev"
 
+# challenger-service internal gRPC (mark-read resolves navigate). Required at
+# boot; the dial is lazy. Locally point it at a challenger running with
+# CHALLENGER_ROLES=api,grpc and CHALLENGER_GRPC_PORT=7992.
+SVC_CHALLENGER_GRPC_ADDR   = "dns:///localhost:7992"
+SVC_CHALLENGER_GRPC_SECRET = "local-grpc-secret-dev-only"
+# SVC_CHALLENGER_GRPC_CALL_TIMEOUT = "2s"
+# SVC_CHALLENGER_GRPC_MAX_ATTEMPTS = "3"
+
 # Internal-Secret for DELETE /api/v1/internal/notifications/users/{user_id}
 # (account-deletion purge). Empty = route not mounted; when set, ≥ 32 bytes.
 # SVC_NOTIFICATION_INTERNAL_API_SECRET = "local-internal-secret-dev-only-0123456789"
