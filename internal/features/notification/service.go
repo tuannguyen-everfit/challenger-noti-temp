@@ -557,7 +557,7 @@ func (s *Service) MarkRead(ctx context.Context, in MarkReadInput) (MarkReadResul
 		if err := s.repo.UpdateRead(ctx, cur.ID, u); err != nil {
 			return err
 		}
-		n = applyReadUpdate(cur, u)
+		n = buildUpdatedNotification(cur, u)
 		return s.recordAudit(ctx, buildNotificationAudit(cur, actor, changes, now))
 	})
 	if err != nil {
@@ -838,7 +838,7 @@ func buildReadUpdate(n Notification, action ReadAction, actor Actor, now time.Ti
 	return u, changes
 }
 
-func applyReadUpdate(n Notification, u readUpdate) Notification {
+func buildUpdatedNotification(n Notification, u readUpdate) Notification {
 	if u.ReadAt != nil {
 		n.ReadAt, n.ReadAction = u.ReadAt, u.ReadAction
 	}
